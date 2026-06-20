@@ -81,6 +81,62 @@ def score_group(score: str) -> str | None:
     return "draw"
 
 
+def recommendation_reason(favorite_group: str, raw_top_group: str | None, recommended_group: str | None) -> str:
+    if raw_top_group == favorite_group:
+        return "Raw top exact score already matches the blended WDL favorite."
+    if recommended_group == favorite_group:
+        return "Selected the highest-probability exact score inside the blended WDL favorite outcome group."
+    return "No exact score inside the blended WDL favorite outcome group was available; fell back to raw top exact score."
+
+
+def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> dict:
+    favorite_group, _favorite_probability = match_favorite_group(match)
+    ranked = sorted(match["candidates"], key=lambda row: row["blended_probability"], reverse=True)
+    raw_top = ranked[0] if ranked else {}
+    aligned = [
+        candidate
+        for candidate in ranked
+        if candidate["group"] == favorite_group and "其它" not in candidate["score"]
+    ]
+    recommendation = aligned[0] if aligned else raw_top
+    top_probability = float(recommendation.get("blended_probability", 0.0) or 0.0)
+    tied = [
+        candidate
+        for candidate in (aligned if aligned else ranked)
+        if "其它" not in candidate["score"]
+        and abs(float(candidate.get("blended_probability", 0.0) or 0.0) - top_probability) <= tie_tolerance
+    ]
+    if not tied and recommendation:
+        tied = [recommendation]
+    score_items = [
+        {
+            "score": candidate.get("score"),
+            "group": candidate.get("group"),
+            "model_probability": candidate.get("model_probability", 0.0),
+            "market_probability": candidate.get("market_probability", 0.0),
+            "blended_probability": candidate.get("blended_probability", 0.0),
+            "odds": candidate.get("odds"),
+        }
+        for candidate in tied
+    ]
+    return {
+        "favorite_group": favorite_group,
+        "raw_top_score": raw_top.get("score"),
+        "raw_top_group": raw_top.get("group"),
+        "score": recommendation.get("score"),
+        "group": recommendation.get("group"),
+        "scores": score_items,
+        "tie_count": len(score_items),
+        "tie_tolerance": tie_tolerance,
+        "model_probability": recommendation.get("model_probability", 0.0),
+        "market_probability": recommendation.get("market_probability", 0.0),
+        "blended_probability": recommendation.get("blended_probability", 0.0),
+        "odds": recommendation.get("odds"),
+        "aligned_with_wdl": recommendation.get("group") == favorite_group,
+        "reason": recommendation_reason(favorite_group, raw_top.get("group"), recommendation.get("group")),
+    }
+
+
 def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_weight: float, stake: float) -> dict:
     home_name = item["home_team"]
     away_name = item["away_team"]
@@ -135,7 +191,7 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         candidate.update(expected_value_fields(blended_probability, row["odds"], stake))
         candidates.append(candidate)
     candidates.sort(key=lambda row: (row["value_proxy"], row["blended_probability"], row["odds"]), reverse=True)
-    return {
+    match = {
         "match": f"{home_name} vs {away_name}",
         "home_team": home_name,
         "away_team": away_name,
@@ -145,6 +201,8 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         "blended_wdl": blend_wdl,
         "candidates": candidates,
     }
+    match["recommended_score"] = recommended_score_candidates(match)
+    return match
 
 
 def candidate_balance_score(candidate: dict, odds_power: float) -> float:
@@ -502,13 +560,22 @@ def write_markdown(result: dict) -> str:
                 "",
                 f"### {match['match']}",
                 "",
-                "| 序号 | 比分 | 结果 | 模型概率 | 赔率隐含 | 混合概率 | 赔率 | 盈亏平衡 | 命中返还 | 预期返还 | 预期净收益 | ROI |",
-                "|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| 序号 | 比分 | 结果 | 推荐 | 模型概率 | 赔率隐含 | 混合概率 | 赔率 | 盈亏平衡 | 命中返还 | 预期返还 | 预期净收益 | ROI |",
+                "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
+        recommended_scores = {
+            item.get("score")
+            for item in match.get("recommended_score", {}).get("scores", [])
+            if item.get("score")
+        }
+        if not recommended_scores and match.get("recommended_score", {}).get("score"):
+            recommended_scores = {match["recommended_score"]["score"]}
         for index, row in enumerate(score_rows(match, result["score_table_limit"], result["show_all_scores"]), start=1):
+            marker = "胜负一致首选" if row["score"] in recommended_scores else ""
             lines.append(
                 f"| {index} | {md_cell(row['score'])} | {outcome_label(row['group'])} | "
+                f"{marker} | "
                 f"{format_pct(row['model_probability'])} | {format_pct(row['market_probability'])} | "
                 f"{format_pct(row['blended_probability'])} | {row['odds']:.2f} | "
                 f"{format_pct(row['break_even_probability'])} | {format_money(row['return_if_hit'])} | "
