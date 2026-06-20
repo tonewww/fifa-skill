@@ -89,8 +89,41 @@ def recommendation_reason(favorite_group: str, raw_top_group: str | None, recomm
     return "No exact score inside the blended WDL favorite outcome group was available; fell back to raw top exact score."
 
 
+def recommendation_analysis_note(
+    favorite_group: str,
+    favorite_probability: float,
+    raw_top: dict,
+    recommendation: dict,
+    tie_count: int,
+) -> str:
+    favorite_label = outcome_label(favorite_group)
+    recommended_group = recommendation.get("group")
+    raw_top_score = raw_top.get("score")
+    raw_top_group = raw_top.get("group")
+    if recommended_group != favorite_group:
+        return (
+            f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
+            "但缺少该方向可用比分，退回全表概率最高比分。"
+        )
+    if raw_top_score and raw_top_group and raw_top_group != favorite_group:
+        return (
+            f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+            f"原始最高比分 {raw_top_score} 偏{outcome_label(raw_top_group)}，"
+            f"因此改取{favorite_label}方向内概率最高比分。"
+        )
+    if tie_count > 1:
+        return (
+            f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+            f"{favorite_label}方向内存在多个并列最高比分，全部保留展示。"
+        )
+    return (
+        f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
+        f"首选比分同属{favorite_label}方向且为该方向内最高概率比分。"
+    )
+
+
 def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> dict:
-    favorite_group, _favorite_probability = match_favorite_group(match)
+    favorite_group, favorite_probability = match_favorite_group(match)
     ranked = sorted(match["candidates"], key=lambda row: row["blended_probability"], reverse=True)
     raw_top = ranked[0] if ranked else {}
     aligned = [
@@ -119,8 +152,16 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         }
         for candidate in tied
     ]
+    analysis_note = recommendation_analysis_note(
+        favorite_group,
+        favorite_probability,
+        raw_top,
+        recommendation,
+        len(score_items),
+    )
     return {
         "favorite_group": favorite_group,
+        "favorite_probability": favorite_probability,
         "raw_top_score": raw_top.get("score"),
         "raw_top_group": raw_top.get("group"),
         "score": recommendation.get("score"),
@@ -134,6 +175,7 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         "odds": recommendation.get("odds"),
         "aligned_with_wdl": recommendation.get("group") == favorite_group,
         "reason": recommendation_reason(favorite_group, raw_top.get("group"), recommendation.get("group")),
+        "analysis_note": analysis_note,
     }
 
 
@@ -530,6 +572,22 @@ def parlay_legs_text(parlay: dict) -> str:
     return " / ".join(f"{leg['match']} {leg['score']}" for leg in parlay["legs"])
 
 
+def recommended_scores_text(match: dict) -> str:
+    recommendation = match.get("recommended_score") or {}
+    scores = [item.get("score") for item in recommendation.get("scores", []) if item.get("score")]
+    if not scores and recommendation.get("score"):
+        scores = [recommendation["score"]]
+    return " / ".join(scores) if scores else "-"
+
+
+def recommended_score_probability(match: dict) -> float:
+    recommendation = match.get("recommended_score") or {}
+    scores = [item for item in recommendation.get("scores", []) if item.get("score")]
+    if scores:
+        return float(scores[0].get("blended_probability") or 0.0)
+    return float(recommendation.get("blended_probability") or 0.0)
+
+
 def write_markdown(result: dict) -> str:
     lines = [
         f"数据口径：{result['odds_path']}；混合概率 = 模型 {format_pct(1 - result['market_weight'])} + 赔率隐含 {format_pct(result['market_weight'])}。",
@@ -555,10 +613,17 @@ def write_markdown(result: dict) -> str:
     score_title = "## 2. 各场次的完整比分概率与预期收入" if result["show_all_scores"] else "## 2. 各场次的比分预测 Top 8 与预期收入"
     lines.extend(["", score_title])
     for match in result["matches"]:
+        recommendation = match.get("recommended_score") or {}
         lines.extend(
             [
                 "",
                 f"### {match['match']}",
+                "",
+                (
+                    f"推荐说明：首选比分 {md_cell(recommended_scores_text(match))}"
+                    f"（混合概率 {format_pct(recommended_score_probability(match))}）；"
+                    f"{md_cell(recommendation.get('analysis_note', '按胜负倾向内最高概率比分输出。'))}"
+                ),
                 "",
                 "| 序号 | 比分 | 结果 | 推荐 | 模型概率 | 赔率隐含 | 混合概率 | 赔率 | 盈亏平衡 | 命中返还 | 预期返还 | 预期净收益 | ROI |",
                 "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",

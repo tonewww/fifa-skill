@@ -108,6 +108,31 @@ def fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, size: int, mi
     return font(min_size)
 
 
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, fnt, max_lines: int = 2) -> list[str]:
+    if not text:
+        return []
+    lines: list[str] = []
+    current = ""
+    for char in text:
+        candidate = current + char
+        if current and text_size(draw, candidate, fnt)[0] > max_width:
+            lines.append(current)
+            current = char
+            if len(lines) == max_lines:
+                break
+        else:
+            current = candidate
+    if len(lines) < max_lines and current:
+        lines.append(current)
+    if len(lines) == max_lines:
+        consumed = "".join(lines)
+        if len(consumed) < len(text):
+            while lines[-1] and text_size(draw, f"{lines[-1]}…", fnt)[0] > max_width:
+                lines[-1] = lines[-1][:-1]
+            lines[-1] = f"{lines[-1]}…"
+    return lines
+
+
 def rounded(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], fill: str, outline: str | None = None, width: int = 1, radius: int = 8):
     draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
 
@@ -213,6 +238,21 @@ def recommended_probability(match: dict) -> float:
     return float(top_scores(match)[0].get("blended_probability") or 0.0)
 
 
+def score_explanation(match: dict) -> str:
+    recommendation = match.get("recommended_score") or {}
+    favorite_group = recommendation.get("favorite_group")
+    if not favorite_group:
+        favorite_group = max(match["blended_wdl"].items(), key=lambda item: item[1])[0]
+    favorite_label = outcome_label(favorite_group)
+    raw_top_score = recommendation.get("raw_top_score")
+    raw_top_group = recommendation.get("raw_top_group")
+    if raw_top_score and raw_top_group and raw_top_group != favorite_group:
+        return f"说明：原始最高{raw_top_score}偏{outcome_label(raw_top_group)}，发布按{favorite_label}倾向优先。"
+    if int(recommendation.get("tie_count") or 1) > 1:
+        return f"说明：{favorite_label}方向内并列最高，多个比分同时保留。"
+    return f"说明：在{favorite_label}倾向内选择最高概率比分。"
+
+
 def card_scores(data: dict) -> Path:
     image, draw = base_card("AI比分预估", "世界杯 2026 比分预测", "02")
     panels = [
@@ -233,7 +273,8 @@ def card_scores(data: dict) -> Path:
         draw_text(draw, (x1 + 66, y1 + 140), score, fit_text(draw, score, 240, 78, 42), COLORS["red"])
         draw.line((x1 + 330, y1 + 125, x2 - 60, y1 + 125), fill=COLORS["line"], width=2)
         draw_text(draw, (x1 + 330, y1 + 143), f"概率 {pct(recommended_probability(match))}", FONTS["small"], COLORS["green"])
-        draw_text(draw, (x1 + 330, y1 + 174), "说明：在胜负倾向内优先。", FONTS["small"], COLORS["muted"])
+        for line_index, line in enumerate(wrap_text(draw, score_explanation(match), x2 - x1 - 390, FONTS["tiny"], 2)):
+            draw_text(draw, (x1 + 330, y1 + 176 + line_index * 26), line, FONTS["tiny"], COLORS["muted"])
     draw_text(draw, (170, 1360), "说明：AI 模型计算结果，不构成建议。", FONTS["small"], COLORS["muted"])
     out = OUT_DIR / "2026-06-21-02-score-pick.png"
     image.save(out, quality=95)
@@ -299,7 +340,10 @@ def write_copy(data: dict, paths: list[Path]) -> Path:
 
     score_lines = []
     for match in data["matches"]:
-        score_lines.append(f"- {match['match']}：{recommended_scores_text(match)}")
+        score_lines.append(
+            f"- {match['match']}：{recommended_scores_text(match)}，概率 {pct(recommended_probability(match))}。"
+            f"{score_explanation(match).replace('说明：', '')}"
+        )
 
     parlay_lines = []
     for title, key in [
