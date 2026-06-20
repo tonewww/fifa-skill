@@ -244,6 +244,9 @@ TABLE_COLUMNS: dict[str, list[str]] = {
         "mae_goals",
         "exact_score_accuracy",
         "top8_score_hit_rate",
+        "favorite_accuracy",
+        "avg_actual_outcome_probability",
+        "calibration_json",
         "notes",
     ],
     "backtest_predictions": [
@@ -426,6 +429,8 @@ REAL_COLUMNS = {
     "mae_goals",
     "exact_score_accuracy",
     "top8_score_hit_rate",
+    "favorite_accuracy",
+    "avg_actual_outcome_probability",
     "tempo",
     "press_intensity",
     "defensive_line",

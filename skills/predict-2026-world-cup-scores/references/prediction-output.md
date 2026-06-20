@@ -102,11 +102,14 @@ When exact-score odds are provided:
 - Use exactly three sections for the main Markdown output, and render all three sections as Markdown tables:
   1. `各场次的胜负关系`: one table with match, blended win/draw/loss probabilities, favored result, and favored probability.
   2. `各场次的比分预测 Top 8` or `各场次的完整比分概率与预期收入`: one table per match with exact scores by blended probability, including model probability, odds-implied probability, blended probability, odds, break-even probability, hit return, expected return, expected net profit, and ROI.
-  3. `4 串 1 的预测 Top 6`: two tables, one for probability-first positions 1-3 and one for odds-first positions 4-6.
-- Split the four-leg Top 6 into two ordered blocks:
+  3. `4 串 1 的预测 Top 9`: three tables: probability-first positions 1-3, odds-first positions 4-6, and expected-value-first positions 7-9.
+- Split the four-leg Top 9 into three ordered blocks:
   - Positions 1-3: prioritize combined blended hit probability first, then odds/balance.
-  - Positions 4-6: prioritize combined decimal odds first, but keep a medium per-leg probability and value floor.
+  - Positions 4-6: prioritize combined decimal odds first, but keep a medium per-leg probability and value floor; allow only bounded deviations from clear-favorite outcomes.
+  - Positions 7-9: prioritize expected net profit / ROI, keep leg-level probability and value floors, allow a slightly wider but still bounded clear-favorite deviation count, and label this block as high variance.
 - In strength-aware mode, when a match has a clear blended WDL favorite, filter four-leg candidates to that favorite's outcome group before ranking exact scores.
+- Treat a clear favorite as either high absolute WDL probability or a large gap over the second-most likely result; football draws often keep absolute favorite probabilities below 55%.
+- Show the clear-favorite deviation count for each four-leg combination when bounded deviations are enabled.
 - For four-leg exact-score combinations, show combined decimal odds, blended hit probability, hit return, expected return, expected net profit, ROI, and a balance or value proxy.
 - When the odds table includes `胜其它`, `平其它`, or `负其它`, estimate its model probability as the remaining probability mass inside that outcome group after listed exact scores are removed.
 - If the user does not provide a stake, use 1 unit; if they provide a stake, use it consistently for all single-score and parlay expected-value calculations.

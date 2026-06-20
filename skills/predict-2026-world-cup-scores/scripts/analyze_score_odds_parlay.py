@@ -159,22 +159,36 @@ def match_favorite_group(match: dict) -> tuple[str, float]:
     return favorite_group, favorite_probability
 
 
+def match_favorite_edge(match: dict) -> float:
+    probabilities = sorted(match["blended_wdl"].values(), reverse=True)
+    if len(probabilities) < 2:
+        return 0.0
+    return probabilities[0] - probabilities[1]
+
+
 def eligible_candidates(
     match: dict,
     min_leg_probability: float,
     min_leg_value: float,
     mode: str,
     strong_favorite_threshold: float,
+    strong_favorite_edge_threshold: float,
+    restrict_clear_favorite: bool,
     odds_power: float,
 ) -> list[dict]:
     favorite_group, favorite_probability = match_favorite_group(match)
+    favorite_edge = match_favorite_edge(match)
     eligible = [
         candidate
         for candidate in match["candidates"]
         if candidate["blended_probability"] >= min_leg_probability
         and candidate["value_proxy"] >= min_leg_value
     ]
-    if mode == "strength-aware" and favorite_probability >= strong_favorite_threshold:
+    is_clear_favorite = (
+        favorite_probability >= strong_favorite_threshold
+        or favorite_edge >= strong_favorite_edge_threshold
+    )
+    if mode == "strength-aware" and is_clear_favorite and restrict_clear_favorite:
         favorite_eligible = [candidate for candidate in eligible if candidate["group"] == favorite_group]
         if favorite_eligible:
             eligible = favorite_eligible
@@ -210,16 +224,29 @@ def build_parlays(
     top: int,
     mode: str,
     strong_favorite_threshold: float,
+    strong_favorite_edge_threshold: float,
+    restrict_clear_favorites: bool,
+    max_clear_favorite_deviations: int | None,
     odds_power: float,
 ) -> list[dict]:
     leg_sets = []
+    favorite_context = []
     for match in matches:
+        favorite_group, favorite_probability = match_favorite_group(match)
+        favorite_edge = match_favorite_edge(match)
+        is_clear_favorite = (
+            favorite_probability >= strong_favorite_threshold
+            or favorite_edge >= strong_favorite_edge_threshold
+        )
+        favorite_context.append((is_clear_favorite, favorite_group))
         eligible = eligible_candidates(
             match,
             min_leg_probability,
             min_leg_value,
             mode,
             strong_favorite_threshold,
+            strong_favorite_edge_threshold,
+            restrict_clear_favorites,
             odds_power,
         )
         leg_sets.append(eligible[:14])
@@ -227,6 +254,16 @@ def build_parlays(
         return []
     parlays = []
     for legs in itertools.product(*leg_sets):
+        clear_favorite_deviations = sum(
+            1
+            for leg, (is_clear_favorite, favorite_group) in zip(legs, favorite_context)
+            if is_clear_favorite and leg["group"] != favorite_group
+        )
+        if (
+            max_clear_favorite_deviations is not None
+            and clear_favorite_deviations > max_clear_favorite_deviations
+        ):
+            continue
         combined_odds = math.prod(leg["odds"] for leg in legs)
         combined_probability = math.prod(leg["blended_probability"] for leg in legs)
         value_proxy = combined_odds * combined_probability
@@ -238,6 +275,7 @@ def build_parlays(
                 "blended_probability": combined_probability,
                 "value_proxy": value_proxy,
                 "balance_score": balance_score,
+                "clear_favorite_deviations": clear_favorite_deviations,
             }
         )
     if mode == "high-odds":
@@ -258,16 +296,29 @@ def parlay_pool(
     min_leg_probability: float,
     min_leg_value: float,
     strong_favorite_threshold: float,
+    strong_favorite_edge_threshold: float,
+    restrict_clear_favorites: bool,
+    max_clear_favorite_deviations: int | None,
     odds_power: float,
 ) -> list[dict]:
     leg_sets = []
+    favorite_context = []
     for match in matches:
+        favorite_group, favorite_probability = match_favorite_group(match)
+        favorite_edge = match_favorite_edge(match)
+        is_clear_favorite = (
+            favorite_probability >= strong_favorite_threshold
+            or favorite_edge >= strong_favorite_edge_threshold
+        )
+        favorite_context.append((is_clear_favorite, favorite_group))
         eligible = eligible_candidates(
             match,
             min_leg_probability,
             min_leg_value,
             "strength-aware",
             strong_favorite_threshold,
+            strong_favorite_edge_threshold,
+            restrict_clear_favorites,
             odds_power,
         )
         leg_sets.append(eligible[:14])
@@ -276,6 +327,16 @@ def parlay_pool(
 
     parlays = []
     for legs in itertools.product(*leg_sets):
+        clear_favorite_deviations = sum(
+            1
+            for leg, (is_clear_favorite, favorite_group) in zip(legs, favorite_context)
+            if is_clear_favorite and leg["group"] != favorite_group
+        )
+        if (
+            max_clear_favorite_deviations is not None
+            and clear_favorite_deviations > max_clear_favorite_deviations
+        ):
+            continue
         combined_odds = math.prod(leg["odds"] for leg in legs)
         combined_probability = math.prod(leg["blended_probability"] for leg in legs)
         value_proxy = combined_odds * combined_probability
@@ -287,6 +348,7 @@ def parlay_pool(
                 "blended_probability": combined_probability,
                 "value_proxy": value_proxy,
                 "balance_score": balance_score,
+                "clear_favorite_deviations": clear_favorite_deviations,
             }
         )
     return parlays
@@ -304,7 +366,12 @@ def split_parlays(
     probability_min_leg_value: float,
     odds_min_leg_probability: float,
     odds_min_leg_value: float,
+    ev_min_leg_probability: float,
+    ev_min_leg_value: float,
     strong_favorite_threshold: float,
+    strong_favorite_edge_threshold: float,
+    odds_max_clear_favorite_deviations: int | None,
+    ev_max_clear_favorite_deviations: int | None,
     odds_power: float,
     per_group: int = 3,
 ) -> dict[str, list[dict]]:
@@ -313,6 +380,9 @@ def split_parlays(
         probability_min_leg_probability,
         probability_min_leg_value,
         strong_favorite_threshold,
+        strong_favorite_edge_threshold,
+        True,
+        0,
         odds_power,
     )
     enrich_parlays(probability_pool, 1.0)
@@ -328,6 +398,9 @@ def split_parlays(
         odds_min_leg_probability,
         odds_min_leg_value,
         strong_favorite_threshold,
+        strong_favorite_edge_threshold,
+        False,
+        odds_max_clear_favorite_deviations,
         odds_power,
     )
     enrich_parlays(odds_pool, 1.0)
@@ -336,9 +409,29 @@ def split_parlays(
         key=lambda row: (row["combined_odds"], row["balance_score"], row["blended_probability"]),
         reverse=True,
     )
+    odds_first = odds_pool[:per_group]
+
+    seen.update(parlay_signature(parlay) for parlay in odds_first)
+    ev_pool = parlay_pool(
+        matches,
+        ev_min_leg_probability,
+        ev_min_leg_value,
+        strong_favorite_threshold,
+        strong_favorite_edge_threshold,
+        False,
+        ev_max_clear_favorite_deviations,
+        odds_power,
+    )
+    enrich_parlays(ev_pool, 1.0)
+    ev_pool = [parlay for parlay in ev_pool if parlay_signature(parlay) not in seen]
+    ev_pool.sort(
+        key=lambda row: (row["expected_profit"], row["roi"], row["balance_score"], row["blended_probability"]),
+        reverse=True,
+    )
     return {
         "probability_first": probability_first,
-        "odds_first": odds_pool[:per_group],
+        "odds_first": odds_first,
+        "expected_value_first": ev_pool[:per_group],
     }
 
 
@@ -422,19 +515,19 @@ def write_markdown(result: dict) -> str:
                 f"{format_money(row['expected_return'])} | {format_money(row['expected_profit'])} | "
                 f"{format_pct(row['roi'])} |"
             )
-    lines.extend(["", "## 3. 4 串 1 的预测 Top 6"])
+    lines.extend(["", "## 3. 4 串 1 的预测 Top 9"])
     lines.extend(
         [
             "",
             "### 前 3 个：胜率优先，赔率其次",
             "",
-            "| 序号 | 串关比分 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for index, parlay in enumerate(result["parlay_groups"]["probability_first"], start=1):
         lines.append(
-            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay['combined_odds']:.2f} | "
+            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | {parlay['combined_odds']:.2f} | "
             f"{format_pct(parlay['blended_probability'])} | {format_money(parlay['return_if_hit'])} | "
             f"{format_money(parlay['expected_return'])} | {format_money(parlay['expected_profit'])} | "
             f"{format_pct(parlay['roi'])} | {parlay['balance_score']:.6f} |"
@@ -444,13 +537,29 @@ def write_markdown(result: dict) -> str:
             "",
             "### 后 3 个：赔率优先，胜率保持中等门槛",
             "",
-            "| 序号 | 串关比分 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for index, parlay in enumerate(result["parlay_groups"]["odds_first"], start=4):
         lines.append(
-            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay['combined_odds']:.2f} | "
+            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | {parlay['combined_odds']:.2f} | "
+            f"{format_pct(parlay['blended_probability'])} | {format_money(parlay['return_if_hit'])} | "
+            f"{format_money(parlay['expected_return'])} | {format_money(parlay['expected_profit'])} | "
+            f"{format_pct(parlay['roi'])} | {parlay['balance_score']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### 期望收益最高 3 个：EV 优先，高方差",
+            "",
+            "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for index, parlay in enumerate(result["parlay_groups"]["expected_value_first"], start=7):
+        lines.append(
+            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | {parlay['combined_odds']:.2f} | "
             f"{format_pct(parlay['blended_probability'])} | {format_money(parlay['return_if_hit'])} | "
             f"{format_money(parlay['expected_return'])} | {format_money(parlay['expected_profit'])} | "
             f"{format_pct(parlay['roi'])} | {parlay['balance_score']:.6f} |"
@@ -478,6 +587,12 @@ def main() -> None:
         help="In strength-aware mode, restrict strong-favorite matches to the favored outcome group above this blended WDL probability.",
     )
     parser.add_argument(
+        "--strong-favorite-edge-threshold",
+        type=float,
+        default=0.16,
+        help="Also restrict strength-aware matches when the favored WDL probability exceeds the runner-up by this margin.",
+    )
+    parser.add_argument(
         "--odds-power",
         type=float,
         default=0.35,
@@ -487,6 +602,20 @@ def main() -> None:
     parser.add_argument("--probability-first-min-leg-value", type=float, default=0.45)
     parser.add_argument("--odds-first-min-leg-probability", type=float, default=0.04)
     parser.add_argument("--odds-first-min-leg-value", type=float, default=0.45)
+    parser.add_argument("--ev-first-min-leg-probability", type=float, default=0.04)
+    parser.add_argument("--ev-first-min-leg-value", type=float, default=0.45)
+    parser.add_argument(
+        "--odds-first-max-clear-favorite-deviations",
+        type=int,
+        default=1,
+        help="Maximum clear-favorite outcome deviations allowed in the odds-first four-leg group.",
+    )
+    parser.add_argument(
+        "--ev-first-max-clear-favorite-deviations",
+        type=int,
+        default=2,
+        help="Maximum clear-favorite outcome deviations allowed in the EV-first four-leg group.",
+    )
     parser.add_argument("--format", choices=["json", "markdown"], default="markdown")
     args = parser.parse_args()
 
@@ -503,6 +632,9 @@ def main() -> None:
         args.top,
         args.mode,
         args.strong_favorite_threshold,
+        args.strong_favorite_edge_threshold,
+        args.mode == "strength-aware",
+        None,
         args.odds_power,
     )
     enrich_parlays(parlays, args.stake)
@@ -512,7 +644,12 @@ def main() -> None:
         args.probability_first_min_leg_value,
         args.odds_first_min_leg_probability,
         args.odds_first_min_leg_value,
+        args.ev_first_min_leg_probability,
+        args.ev_first_min_leg_value,
         args.strong_favorite_threshold,
+        args.strong_favorite_edge_threshold,
+        args.odds_first_max_clear_favorite_deviations,
+        args.ev_first_max_clear_favorite_deviations,
         args.odds_power,
         3,
     )
@@ -528,6 +665,9 @@ def main() -> None:
         "min_leg_value": args.min_leg_value,
         "mode": args.mode,
         "strong_favorite_threshold": args.strong_favorite_threshold,
+        "strong_favorite_edge_threshold": args.strong_favorite_edge_threshold,
+        "odds_first_max_clear_favorite_deviations": args.odds_first_max_clear_favorite_deviations,
+        "ev_first_max_clear_favorite_deviations": args.ev_first_max_clear_favorite_deviations,
         "odds_power": args.odds_power,
         "matches": matches,
         "parlays": parlays,

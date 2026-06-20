@@ -7,10 +7,23 @@ import argparse
 import json
 from pathlib import Path
 
-from common import average, clamp, connect, slugify, today_utc, weighted_average
+from common import average, clamp, connect, today_utc, weighted_average
 
 
 SOURCE_ID = "derived_team_features"
+
+
+def competition_weight(competition: str | None) -> float:
+    text = (competition or "").lower()
+    if "world cup" in text and "qualification" not in text:
+        return 1.35
+    if "euro" in text or "copa am" in text or "african cup" in text or "gold cup" in text:
+        return 1.20
+    if "qualification" in text or "nations league" in text:
+        return 1.10
+    if "friendly" in text:
+        return 0.75
+    return 1.0
 
 
 def position_bucket(position: str | None) -> str:
@@ -55,6 +68,24 @@ def top_average(players: list[dict], key: str, limit: int, default: float = 50.0
     return average(values[:limit], default)
 
 
+def metric(row: dict, key: str, fallback_key: str | None = None) -> float | None:
+    value = row.get(key)
+    if value is None and fallback_key:
+        value = row.get(fallback_key)
+    return None if value is None else float(value)
+
+
+def weighted_metric(rows: list[dict], key: str, default: float, fallback_key: str | None = None) -> float:
+    values = []
+    for index, row in enumerate(rows):
+        value = metric(row, key, fallback_key)
+        if value is None:
+            continue
+        recency_weight = 1.0 / (1.0 + index * 0.08)
+        values.append((value, recency_weight * competition_weight(row.get("competition"))))
+    return weighted_average(values, default)
+
+
 def recent_result_features(conn, team_id: str, limit: int) -> dict:
     rows = conn.execute(
         """
@@ -72,19 +103,39 @@ def recent_result_features(conn, team_id: str, limit: int) -> dict:
             "sample": 0,
             "goals_for": 1.25,
             "goals_against": 1.25,
+            "xg_for": 1.25,
+            "xg_against": 1.25,
             "goal_diff": 0.0,
+            "xg_diff": 0.0,
+            "shots": 11.0,
+            "shots_on_target": 4.0,
+            "possession": 50.0,
             "clean_sheet_rate": 0.25,
             "failed_score_rate": 0.25,
+            "competitive_weight": 1.0,
         }
-    goals_for = average([row["goals_for"] for row in rows], 1.25)
-    goals_against = average([row["goals_against"] for row in rows], 1.25)
+    goals_for = weighted_metric(rows, "goals_for", 1.25)
+    goals_against = weighted_metric(rows, "goals_against", 1.25)
+    xg_for = weighted_metric(rows, "xg_for", goals_for, "goals_for")
+    xg_against = weighted_metric(rows, "xg_against", goals_against, "goals_against")
+    shots = weighted_metric(rows, "shots", 11.0)
+    shots_on_target = weighted_metric(rows, "shots_on_target", 4.0)
+    possession = weighted_metric(rows, "possession", 50.0)
+    total_weight = sum(competition_weight(row.get("competition")) for row in rows) or len(rows)
     return {
         "sample": len(rows),
         "goals_for": goals_for,
         "goals_against": goals_against,
+        "xg_for": xg_for,
+        "xg_against": xg_against,
         "goal_diff": goals_for - goals_against,
+        "xg_diff": xg_for - xg_against,
+        "shots": shots,
+        "shots_on_target": shots_on_target,
+        "possession": possession,
         "clean_sheet_rate": sum(1 for row in rows if int(row["goals_against"] or 0) == 0) / len(rows),
         "failed_score_rate": sum(1 for row in rows if int(row["goals_for"] or 0) == 0) / len(rows),
+        "competitive_weight": total_weight / len(rows),
     }
 
 
@@ -170,32 +221,38 @@ def derive_features(conn, team: dict, profile_date: str, recent_limit: int) -> d
     gk_goalkeeping = weighted_position_average(players, "GK", "rating_goalkeeping", 50.0)
     gk_transition = weighted_position_average(players, "GK", "rating_transition", 50.0)
 
-    goal_diff_signal = clamp(50.0 + recent["goal_diff"] * 8.0, 35.0, 70.0)
+    chance_diff = 0.65 * recent["xg_diff"] + 0.35 * recent["goal_diff"]
+    goal_diff_signal = clamp(50.0 + chance_diff * 8.0, 35.0, 70.0)
+    chance_volume_signal = clamp(50.0 + (recent["shots"] - 11.0) * 1.4 + (recent["shots_on_target"] - 4.0) * 2.0, 35.0, 72.0)
+    possession_signal = clamp(50.0 + (recent["possession"] - 50.0) * 0.55, 35.0, 72.0)
+    competitive_signal = clamp(50.0 + (recent["competitive_weight"] - 1.0) * 10.0, 42.0, 58.0)
     clean_sheet_signal = 50.0 + recent["clean_sheet_rate"] * 18.0
     failed_score_penalty = recent["failed_score_rate"] * 10.0
 
     features = {
         "formation_primary": formation,
-        "tempo": clamp(0.50 * top_transition + 0.25 * mf_possession + 0.25 * goal_diff_signal),
-        "press_intensity": clamp(0.55 * mf_transition + 0.25 * fw_attack + 0.20 * top_defense),
+        "tempo": clamp(0.42 * top_transition + 0.22 * mf_possession + 0.18 * goal_diff_signal + 0.18 * chance_volume_signal),
+        "press_intensity": clamp(0.48 * mf_transition + 0.22 * fw_attack + 0.18 * top_defense + 0.12 * competitive_signal),
         "defensive_line": clamp(47.0 + (top_defense - 50.0) * 0.20 + (gk_transition - 50.0) * 0.18 + (top_transition - 50.0) * 0.12),
-        "buildup_quality": clamp(0.55 * mf_possession + 0.25 * gk_transition + 0.20 * top_possession),
-        "transition_attack": clamp(0.45 * top_transition + 0.35 * fw_attack + 0.20 * goal_diff_signal),
+        "buildup_quality": clamp(0.46 * mf_possession + 0.21 * gk_transition + 0.18 * top_possession + 0.15 * possession_signal),
+        "transition_attack": clamp(0.40 * top_transition + 0.32 * fw_attack + 0.18 * goal_diff_signal + 0.10 * chance_volume_signal),
         "transition_defense": clamp(0.55 * df_defense + 0.25 * mf_transition + 0.20 * clean_sheet_signal),
-        "wing_play": clamp(0.52 * top_transition + 0.28 * fw_attack + 0.20 * mf_possession),
-        "central_progression": clamp(0.55 * mf_possession + 0.25 * top_attack + 0.20 * top_transition),
+        "wing_play": clamp(0.46 * top_transition + 0.25 * fw_attack + 0.17 * mf_possession + 0.12 * chance_volume_signal),
+        "central_progression": clamp(0.48 * mf_possession + 0.22 * top_attack + 0.16 * top_transition + 0.14 * possession_signal),
         "set_piece_attack": clamp(0.50 * df_set_piece + 0.25 * (avg_height - 170.0) + 0.25 * fw_attack),
         "set_piece_defense": clamp(0.48 * df_defense + 0.25 * (avg_height - 170.0) + 0.27 * clean_sheet_signal),
         "aerial_strength": clamp(42.0 + (avg_height - 178.0) * 1.8 + (df_set_piece - 50.0) * 0.35),
-        "low_block_attack": clamp(0.45 * top_attack + 0.35 * mf_possession + 0.20 * goal_diff_signal - failed_score_penalty),
+        "low_block_attack": clamp(0.40 * top_attack + 0.30 * mf_possession + 0.18 * goal_diff_signal + 0.12 * chance_volume_signal - failed_score_penalty),
         "low_block_defense": clamp(0.58 * df_defense + 0.22 * gk_goalkeeping + 0.20 * clean_sheet_signal),
         "keeper_sweeper": clamp(0.65 * gk_transition + 0.35 * gk_goalkeeping),
         "keeper_shot_stopping": clamp(gk_goalkeeping),
         "injury_load": 0.0,
         "cohesion": clamp(45.0 + min(avg_caps, 80.0) * 0.35 - abs(avg_age - 28.0) * 0.45 + min(recent["sample"], 12) * 0.6),
         "travel_fatigue": 0.0,
-        "risk_level": clamp(50.0 + (top_attack - df_defense) * 0.22 + (recent["goals_for"] + recent["goals_against"] - 2.5) * 4.0),
+        "risk_level": clamp(50.0 + (top_attack - df_defense) * 0.22 + (recent["xg_for"] + recent["xg_against"] - 2.5) * 4.0 + (recent["shots"] - 11.0) * 0.35),
         "recent_sample": recent["sample"],
+        "recent_xg_diff": recent["xg_diff"],
+        "recent_chance_volume": chance_volume_signal,
         "avg_age": avg_age,
         "avg_caps": avg_caps,
         "avg_height": avg_height,
@@ -291,7 +348,8 @@ def write_profile(conn, team_id: str, profile_date: str, features: dict) -> None
             (
                 "Derived from player ratings/demographics and recent team_results; "
                 f"recent_sample={features['recent_sample']}, avg_age={features['avg_age']:.1f}, "
-                f"avg_caps={features['avg_caps']:.1f}, avg_height={features['avg_height']:.1f}."
+                f"avg_caps={features['avg_caps']:.1f}, avg_height={features['avg_height']:.1f}, "
+                f"xg_diff={features['recent_xg_diff']:.2f}, chance_volume={features['recent_chance_volume']:.1f}."
             ),
         ),
     )

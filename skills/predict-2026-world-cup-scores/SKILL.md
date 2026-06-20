@@ -94,13 +94,14 @@ python3 skills/predict-2026-world-cup-scores/scripts/predict_match.py --db data/
 9. Analyze exact-score odds when the user provides a local odds JSON.
    - Treat odds as a calibration/reference layer, not betting advice.
    - Use a blended probability when exact-score odds are supplied; default is model 70%, market-implied 30%.
-   - Use the default `--mode strength-aware` for parlays so matches with clear strength/market favorites stay inside the favored outcome group while still considering exact-score odds.
-   - For Markdown output, present exactly three sections: match win/draw/loss relationships, each match's scoreline probability/expected-value table, and four-leg parlay Top 6.
+   - Use the default `--mode strength-aware` for parlays so matches with clear strength/market favorites stay inside the favored outcome group while still considering exact-score odds. The script treats either an absolute favorite probability or a favorite-vs-runner-up gap as a clear edge.
+   - For Markdown output, present exactly three sections: match win/draw/loss relationships, each match's scoreline probability/expected-value table, and four-leg parlay Top 9.
    - Use `--stake` to set the stake unit for expected return/profit calculations. Use `--show-all-scores` when the user asks for a complete odds-table calculation, including `胜其它` / `平其它` / `负其它` rows.
-   - Split the parlay Top 6 into two blocks: first 3 by win-probability first and odds second; last 3 by odds first while retaining a medium probability/value floor.
+   - Split the parlay Top 9 into three blocks: first 3 by win-probability first and odds second; next 3 by odds first while retaining a medium probability/value floor; final 3 by expected net profit / ROI with high-variance caveats.
+   - Keep the probability-first block inside clear favorites. Let odds-first and EV-first allow bounded deviations from clear-favorite outcomes (`--odds-first-max-clear-favorite-deviations`, `--ev-first-max-clear-favorite-deviations`) so strength mismatches still matter without suppressing every value candidate.
 
 ```bash
-python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.py --db data/worldcup2026.sqlite --odds-json pl/YYYY-MM-DD.json --top 6 --mode strength-aware --stake 100 --show-all-scores
+python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.py --db data/worldcup2026.sqlite --odds-json pl/YYYY-MM-DD.json --top 9 --mode strength-aware --stake 100 --show-all-scores
 ```
 
 ## Modeling Rules

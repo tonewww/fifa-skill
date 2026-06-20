@@ -31,12 +31,25 @@ Before adding weight to a factor, ask whether it is source-backed, predictive, a
 
 - Current-snapshot leakage: using 2026 squads/features to backtest older matches is only a calibration pressure test, not strict historical validation.
 - Market anchoring: exact-score odds can improve calibration but can also drown out model signal if the blend weight is too high.
+- Odds overround: bookmaker odds include margin. Normalize implied probabilities before blending, and do not treat positive EV as a fact when market margin or stale prices are unknown.
+- Parlay independence: four-leg hit probability is currently the product of leg probabilities. That ignores shared macro factors, market correlation, and model-error correlation.
+- EV sorting risk: high expected value can be an artifact of model miscalibration on long-shot scorelines. Keep probability/value floors and label EV-first outputs as high variance.
 - Thin tactical samples: formation matchup priors are low weight unless enough completed fixtures share reliable formation labels.
 - Independent Poisson limits: low-scoring correlations and game-state effects are not yet modeled.
 - Derived player ratings: baseline ratings from caps/age/position are weaker than licensed provider ratings and should raise uncertainty.
 - Injury and lineup missingness: unknown availability should not be treated as full certainty.
+- Club-match transfer risk: club backtests can increase sample size for tactical archetypes, but national-team chemistry, preparation time, player familiarity, travel, and tournament incentives differ.
 
 Optimize only after documenting sample size, date window, data source, and whether historical features were actually available before those matches.
+
+When reviewing a strategy, explicitly answer:
+
+- Is the model leaning too heavily on a weak data layer such as baseline player ratings or current-snapshot tactical profiles?
+- Is the market blend hiding disagreement between model and odds, or only damping extreme model outputs?
+- Are exact-score tails inflated by independent Poisson or by "other score" buckets?
+- Are strong favorites filtered by both absolute WDL probability and WDL edge over the runner-up?
+- Does the backtest show favorite confidence matching actual hit rate by bucket?
+- Does EV remain positive after reasonable shrinkage of model probability toward the market?
 
 ### Components
 
@@ -89,11 +102,19 @@ Run `extract_team_features.py` after importing squads, recent results, player ra
 
 - Squad structure: weighted position mix, top-X player quality, age, caps, height, and role minutes.
 - Player traits: attack, defense, possession, transition, set-piece, goalkeeping, and fitness.
-- Recent form: goals for/against, goal differential, clean-sheet rate, and failed-score rate.
+- Recent form: recency- and competition-weighted goals, xG when available, chance volume from shots/shots-on-target, possession signal, clean-sheet rate, and failed-score rate.
 - Tactical profile: formation tendency, tempo, press intensity, defensive line, buildup quality, transition attack/defense, wing/central creation, set-piece attack/defense, aerial strength, low-block attack/defense, goalkeeper profile, cohesion, and risk level.
 - Generic tactical plan: defensive shape, pressing trigger, buildup pattern, chance creation route, transition plan, set-piece plan.
 
 Treat these generated features as a scaffold. Override them with official lineups, reputable tactical reports, provider metrics, or opponent-specific `tactical_plans` when available.
+
+Useful additional features to import when available:
+
+- Player role and club context: club minutes, league strength, tactical role, weak foot/footedness, aerial duels, progressive passing/carrying, ball recoveries, shot creation, non-penalty xG/xA, set-piece role, goalkeeper PSxG and cross-claim profile.
+- Team phase metrics: xG for/against, non-penalty xG, shots, shots on target, box entries, PPDA/pressing intensity, field tilt, counterattack shot share, set-piece xG, defensive-line height, possession under pressure.
+- Context: rest days, travel distance/time zone, altitude/heat, venue familiarity, referee foul/card tendency, tournament incentives, rotation probability, match state from group standings.
+- Market data: normalized 1X2 and exact-score odds, price movement, dispersion across books, and stale-price flags.
+- Archetype labels: formation family, press/buildup style, transition profile, low-block profile, set-piece orientation, and goalkeeper type. These can be learned from club matches and transferred as low-weight priors to national teams.
 
 ### Player Aggregation
 
@@ -270,7 +291,8 @@ After enough completed matches:
 3. Track log loss, Brier score, calibration by probability bucket, and scoreline error.
 4. Review whether favorites are over- or under-confident.
 5. Review formation-pair samples for systematic tactical bias.
-6. Adjust weights, base-goals, and knockout adjustments.
+6. Review EV stability under model/market blend sensitivity, such as 70/30, 60/40, and 50/50.
+7. Adjust weights, base-goals, and knockout adjustments.
 
 Bundled scripts:
 
@@ -286,6 +308,18 @@ Suggested backtest fields:
 - Match stage.
 - Actual score.
 - Result probability assigned to actual outcome.
+- Favorite outcome, favorite confidence, favorite hit/miss.
+- Calibration bucket, bucket sample size, average confidence, actual hit rate.
+
+### Club-To-National Backtest Transfer
+
+Use club matches only for feature-behavior relationships, not direct national-team strength:
+
+- Build archetype pairs such as high press vs deep buildup, 4-3-3 vs 4-2-3-1, low block vs possession side, set-piece team vs aerially weak team.
+- Backtest whether those archetype pairs change xG, WDL rates, or exact-score frequencies in large club samples.
+- Transfer the learned effect as a small prior into `team_style_profiles`, `formation_matchup_stats`, or `matchup_adjustments`.
+- Shrink club-derived effects aggressively unless the national-team player roles, coach style, and expected lineup match the club archetype.
+- Keep strict separation between national-team outcome calibration and club-derived tactical priors.
 
 ### Historical Results Import
 

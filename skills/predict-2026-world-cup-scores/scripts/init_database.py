@@ -268,6 +268,9 @@ DDL = [
         mae_goals REAL,
         exact_score_accuracy REAL,
         top8_score_hit_rate REAL,
+        favorite_accuracy REAL,
+        avg_actual_outcome_probability REAL,
+        calibration_json TEXT,
         notes TEXT
     )
     """,

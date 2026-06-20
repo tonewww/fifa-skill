@@ -258,6 +258,9 @@ Backtest audit tables.
 - `mae_goals`
 - `exact_score_accuracy`
 - `top8_score_hit_rate`
+- `favorite_accuracy`
+- `avg_actual_outcome_probability`
+- `calibration_json`: probability-bucket diagnostics for favorite confidence versus actual hit rate
 
 `backtest_predictions` stores match-level predictions and actual outcomes for inspection.
 
