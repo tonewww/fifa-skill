@@ -258,7 +258,7 @@ def short_parlay(parlay: dict) -> str:
 
 
 def card_parlays(data: dict) -> Path:
-    image, draw = base_card("4 串 1 方案 Top 9", "PARLAY 三组候选", "03")
+    image, draw = base_card("4 串 1 方案", "世界杯 2026 赛前方案", "03")
     groups = [
         ("前 3：稳健方向", "probability_first", COLORS["soft_green"], "更贴近胜负倾向"),
         ("中 3：进取方向", "odds_first", COLORS["soft_amber"], "保留一处冷门思路"),
