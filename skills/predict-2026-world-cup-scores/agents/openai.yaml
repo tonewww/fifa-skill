@@ -1,0 +1,4 @@
+interface:
+  display_name: "2026 World Cup Score Predictor"
+  short_description: "Predict 2026 World Cup scores from fresh data"
+  default_prompt: "Use $predict-2026-world-cup-scores to refresh the World Cup data model and predict a match score."
