@@ -22,6 +22,26 @@ DEFAULT_PARAMETERS = {
     "fitness_weight": 0.12,
     "style_weight": 1.0,
     "formation_weight": 0.25,
+    "openness_baseline_total": 2.55,
+    "recent_goal_openness_weight": 0.28,
+    "formation_openness_weight": 0.38,
+    "style_openness_weight": 0.20,
+    "tactical_openness_weight": 0.14,
+    "openness_max_delta": 0.95,
+    "stage_group_goal_multiplier": 1.00,
+    "stage_round32_goal_multiplier": 1.00,
+    "stage_round16_goal_multiplier": 1.00,
+    "stage_quarter_goal_multiplier": 1.00,
+    "stage_semi_goal_multiplier": 1.00,
+    "stage_final_goal_multiplier": 1.00,
+    "stage_data_weight": 0.70,
+    "stage_sample_half_life": 36.0,
+    "stage_open_match_resistance": 0.45,
+    "wdl_prior_weight": 0.65,
+    "formation_wdl_prior_max_weight": 0.35,
+    "wdl_score_calibration_weight": 0.70,
+    "favorite_score_tilt": 0.10,
+    "draw_score_tilt": 0.08,
 }
 
 
@@ -50,9 +70,10 @@ def latest_style(conn, team_id: str) -> dict:
         ORDER BY
             profile_date DESC,
             CASE source_id
-                WHEN 'derived_team_features' THEN 0
+                WHEN 'club_feature_merge' THEN 0
                 WHEN 'manual_enhancement_feed' THEN 1
-                ELSE 2
+                WHEN 'derived_team_features' THEN 2
+                ELSE 3
             END
         LIMIT 1
         """,
@@ -66,6 +87,7 @@ def latest_model_parameters(conn) -> dict:
     params["parameter_id"] = "defaults"
     if not table_exists(conn, "model_parameters"):
         return params
+    ensure_model_parameter_columns(conn)
     row = conn.execute(
         """
         SELECT *
@@ -77,10 +99,43 @@ def latest_model_parameters(conn) -> dict:
     if row is None:
         return params
     for key in DEFAULT_PARAMETERS:
-        if row[key] is not None:
+        if key in row.keys() and row[key] is not None:
             params[key] = float(row[key])
     params["parameter_id"] = row["parameter_id"]
     return params
+
+
+def ensure_model_parameter_columns(conn) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_parameters)").fetchall()}
+    additions = {
+        "openness_baseline_total": "REAL",
+        "recent_goal_openness_weight": "REAL",
+        "formation_openness_weight": "REAL",
+        "style_openness_weight": "REAL",
+        "tactical_openness_weight": "REAL",
+        "openness_max_delta": "REAL",
+        "stage_group_goal_multiplier": "REAL",
+        "stage_round32_goal_multiplier": "REAL",
+        "stage_round16_goal_multiplier": "REAL",
+        "stage_quarter_goal_multiplier": "REAL",
+        "stage_semi_goal_multiplier": "REAL",
+        "stage_final_goal_multiplier": "REAL",
+        "stage_data_weight": "REAL",
+        "stage_sample_half_life": "REAL",
+        "stage_open_match_resistance": "REAL",
+        "wdl_prior_weight": "REAL",
+        "formation_wdl_prior_max_weight": "REAL",
+        "wdl_score_calibration_weight": "REAL",
+        "favorite_score_tilt": "REAL",
+        "draw_score_tilt": "REAL",
+    }
+    changed = False
+    for name, ddl_type in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE model_parameters ADD COLUMN {name} {ddl_type}")
+            changed = True
+    if changed:
+        conn.commit()
 
 
 def latest_fifa_ranking(conn, team_id: str) -> dict:
@@ -149,7 +204,7 @@ def latest_lineup(conn, team_id: str, opponent_team_id: str | None = None) -> di
     if table_exists(conn, "lineup_players"):
         player_rows = conn.execute(
             """
-            SELECT lp.*, p.name, p.position AS base_position, p.rating_overall
+            SELECT lp.*, p.name, COALESCE(p.national_team_position, p.position) AS base_position, p.rating_overall
             FROM lineup_players lp
             JOIN players p ON p.player_id = lp.player_id
             WHERE lp.lineup_id = ?
@@ -287,6 +342,16 @@ def formation_goal_delta(stats: dict, weight: float) -> tuple[float, float, str 
     return edge, -edge, note
 
 
+def formation_total_goals(stats: dict) -> float | None:
+    if not stats:
+        return None
+    goals_a = stats.get("avg_goals_a")
+    goals_b = stats.get("avg_goals_b")
+    if goals_a is None or goals_b is None:
+        return None
+    return float(goals_a) + float(goals_b)
+
+
 def tactical_goal_delta(plan: dict) -> float:
     if not plan:
         return 0.0
@@ -294,6 +359,171 @@ def tactical_goal_delta(plan: dict) -> float:
     if risk is None:
         return 0.0
     return clamp((float(risk) - 50.0) / 100.0 * 0.08, -0.06, 0.08)
+
+
+def tactical_risk(plan: dict) -> float:
+    risk = plan.get("risk_level") if plan else None
+    if risk is None:
+        return 50.0
+    try:
+        return float(risk)
+    except (TypeError, ValueError):
+        return 50.0
+
+
+def recent_goal_profile(conn, team_id: str, limit: int = 8) -> dict:
+    rows = conn.execute(
+        """
+        SELECT goals_for, goals_against, competition
+        FROM team_results
+        WHERE team_id = ?
+          AND goals_for IS NOT NULL
+          AND goals_against IS NOT NULL
+        ORDER BY date(match_date) DESC
+        LIMIT ?
+        """,
+        (team_id, limit),
+    ).fetchall()
+    if not rows:
+        return {
+            "sample": 0,
+            "goals_for": 1.25,
+            "goals_against": 1.25,
+            "total_goals": 2.5,
+            "competitive_weight": 1.0,
+        }
+    total_weight = 0.0
+    goals_for = goals_against = total_goals = competitive_weight = 0.0
+    for index, row in enumerate(rows):
+        competition = (row["competition"] or "").lower()
+        comp_weight = 1.0
+        if "world cup" in competition and "qualification" not in competition:
+            comp_weight = 1.35
+        elif "qualification" in competition or "nations league" in competition:
+            comp_weight = 1.10
+        elif "friendly" in competition:
+            comp_weight = 0.75
+        recency_weight = 1.0 / (1.0 + index * 0.12)
+        weight = comp_weight * recency_weight
+        gf = float(row["goals_for"] or 0.0)
+        ga = float(row["goals_against"] or 0.0)
+        goals_for += gf * weight
+        goals_against += ga * weight
+        total_goals += (gf + ga) * weight
+        competitive_weight += comp_weight * recency_weight
+        total_weight += weight
+    return {
+        "sample": len(rows),
+        "goals_for": goals_for / total_weight,
+        "goals_against": goals_against / total_weight,
+        "total_goals": total_goals / total_weight,
+        "competitive_weight": competitive_weight / total_weight,
+    }
+
+
+def style_openness(style_a: dict, style_b: dict) -> tuple[float, list[str]]:
+    tempo = (style_value(style_a, "tempo") + style_value(style_b, "tempo")) / 2.0
+    press = (style_value(style_a, "press_intensity") + style_value(style_b, "press_intensity")) / 2.0
+    transition = (style_value(style_a, "transition_attack") + style_value(style_b, "transition_attack")) / 2.0
+    defensive_security = (style_value(style_a, "transition_defense") + style_value(style_b, "transition_defense")) / 2.0
+    line_height = (style_value(style_a, "defensive_line") + style_value(style_b, "defensive_line")) / 2.0
+    chance_routes = (
+        style_value(style_a, "wing_play")
+        + style_value(style_b, "wing_play")
+        + style_value(style_a, "central_progression")
+        + style_value(style_b, "central_progression")
+    ) / 4.0
+    raw = (
+        0.24 * (tempo - 55.0)
+        + 0.20 * (press - 58.0)
+        + 0.26 * (transition - defensive_security)
+        + 0.14 * (line_height - 50.0)
+        + 0.16 * (chance_routes - 58.0)
+    )
+    delta = clamp(raw / 28.0, -0.22, 0.28)
+    notes = []
+    if tempo >= 59:
+        notes.append("tempo profile points to a higher-event match")
+    if transition - defensive_security >= 4:
+        notes.append("transition attack exceeds transition defense")
+    if press >= 61:
+        notes.append("pressing can create turnovers and short-field chances")
+    if chance_routes >= 62:
+        notes.append("wide/central chance routes support shot volume")
+    return delta, notes[:3]
+
+
+def openness_adjustment(
+    conn,
+    team_a_id: str,
+    team_b_id: str,
+    style_a: dict,
+    style_b: dict,
+    plan_a: dict,
+    plan_b: dict,
+    formation_stats: dict,
+    params: dict,
+) -> dict:
+    baseline = float(params["openness_baseline_total"])
+    recent_a = recent_goal_profile(conn, team_a_id)
+    recent_b = recent_goal_profile(conn, team_b_id)
+    recent_total = (recent_a["total_goals"] + recent_b["total_goals"]) / 2.0
+    recent_confidence = min((recent_a["sample"] + recent_b["sample"]) / 16.0, 1.0)
+    recent_delta = (
+        (recent_total - baseline)
+        * float(params["recent_goal_openness_weight"])
+        * recent_confidence
+    )
+
+    formation_total = formation_total_goals(formation_stats)
+    formation_sample = int(formation_stats.get("sample_size") or 0) if formation_stats else 0
+    formation_confidence = min(formation_sample / 20.0, 1.0)
+    if formation_sample < 5:
+        formation_confidence *= 0.35
+    formation_delta = 0.0
+    if formation_total is not None:
+        formation_delta = (
+            (formation_total - baseline)
+            * float(params["formation_openness_weight"])
+            * formation_confidence
+        )
+
+    style_delta, style_notes = style_openness(style_a, style_b)
+    style_delta *= float(params["style_openness_weight"])
+
+    risk_average = (tactical_risk(plan_a) + tactical_risk(plan_b)) / 2.0
+    tactical_delta = ((risk_average - 50.0) / 50.0) * float(params["tactical_openness_weight"])
+
+    raw_delta = recent_delta + formation_delta + style_delta + tactical_delta
+    total_delta = clamp(raw_delta, -float(params["openness_max_delta"]), float(params["openness_max_delta"]))
+    notes = []
+    if recent_delta >= 0.12:
+        notes.append(f"recent goal profile is open ({recent_total:.2f} total goals avg)")
+    elif recent_delta <= -0.12:
+        notes.append(f"recent goal profile is closed ({recent_total:.2f} total goals avg)")
+    if formation_delta >= 0.12 and formation_total is not None:
+        notes.append(f"formation pair has high historical total goals ({formation_total:.2f})")
+    elif formation_delta <= -0.12 and formation_total is not None:
+        notes.append(f"formation pair has low historical total goals ({formation_total:.2f})")
+    notes.extend(style_notes)
+    if tactical_delta >= 0.04:
+        notes.append(f"tactical risk is above neutral ({risk_average:.0f}/100)")
+    elif tactical_delta <= -0.04:
+        notes.append(f"tactical risk is below neutral ({risk_average:.0f}/100)")
+    return {
+        "total_delta": total_delta,
+        "recent_delta": recent_delta,
+        "formation_delta": formation_delta,
+        "style_delta": style_delta,
+        "tactical_delta": tactical_delta,
+        "recent_a": recent_a,
+        "recent_b": recent_b,
+        "recent_total_goals": recent_total,
+        "formation_total_goals": formation_total,
+        "formation_sample": formation_sample,
+        "tactical_risk_average": risk_average,
+        "notes": notes[:6],
+    }
 
 
 def data_readiness(conn, team_id: str) -> dict:
@@ -429,28 +659,272 @@ def poisson(k: int, lam: float) -> float:
     return math.exp(-lam) * (lam**k) / math.factorial(k)
 
 
-def score_distribution(lambda_a: float, lambda_b: float, max_goals: int = 7) -> tuple[float, float, float, list[dict]]:
-    scores = []
+def score_group_from_goals(goals_a: int, goals_b: int) -> str:
+    if goals_a > goals_b:
+        return "team_a_win"
+    if goals_a < goals_b:
+        return "team_b_win"
+    return "draw"
+
+
+def stage_family(stage: str | None) -> str:
+    text = (stage or "").lower().replace("-", " ")
+    if "group" in text:
+        return "group"
+    if "round of 32" in text or "last 32" in text or "round32" in text:
+        return "round32"
+    if "round of 16" in text or "last 16" in text or "round16" in text:
+        return "round16"
+    if "quarter" in text:
+        return "quarter"
+    if "semi" in text:
+        return "semi"
+    if "final" in text or "third place" in text or "bronze" in text:
+        return "final"
+    if "knockout" in text or "playoff" in text:
+        return "round16"
+    return "group"
+
+
+def stage_completed_goal_profile(conn, family: str) -> dict:
+    if not table_exists(conn, "fixtures"):
+        return {"sample_size": 0, "avg_total_goals": None}
+    rows = conn.execute(
+        """
+        SELECT stage, score_a, score_b
+        FROM fixtures
+        WHERE score_a IS NOT NULL
+          AND score_b IS NOT NULL
+          AND lower(coalesce(status, 'final')) = 'final'
+        """
+    ).fetchall()
+    totals = []
+    for row in rows:
+        if stage_family(row["stage"]) == family:
+            totals.append(float(row["score_a"] or 0) + float(row["score_b"] or 0))
+    if not totals:
+        return {"sample_size": 0, "avg_total_goals": None}
+    return {"sample_size": len(totals), "avg_total_goals": sum(totals) / len(totals)}
+
+
+def stage_goal_context(
+    conn,
+    stage: str | None,
+    params: dict,
+    openness_total_delta: float,
+) -> dict:
+    family = stage_family(stage)
+    key = f"stage_{family}_goal_multiplier"
+    base_multiplier = float(params.get(key, 1.0) or 1.0)
+    profile = stage_completed_goal_profile(conn, family)
+    baseline_total = float(params.get("openness_baseline_total", 2.55) or 2.55)
+    sample_size = int(profile["sample_size"] or 0)
+    avg_total_goals = profile["avg_total_goals"]
+    sample_half_life = max(float(params.get("stage_sample_half_life", 36.0) or 36.0), 1.0)
+    confidence = sample_size / (sample_size + sample_half_life) if sample_size else 0.0
+    data_multiplier = 1.0
+    if avg_total_goals is not None and baseline_total > 0:
+        data_multiplier = clamp(avg_total_goals / baseline_total, 0.76, 1.18)
+
+    data_weight = clamp(float(params.get("stage_data_weight", 0.70) or 0.70), 0.0, 1.0)
+    adaptive_weight = data_weight * confidence
+    multiplier = (1.0 - adaptive_weight) * 1.0 + adaptive_weight * data_multiplier
+
+    if sample_size == 0:
+        multiplier = 1.0
+    elif confidence < 0.25:
+        # With thin round-specific evidence, keep only a small portion of the configured prior.
+        multiplier = 0.82 * multiplier + 0.18 * base_multiplier
+    else:
+        multiplier = 0.55 * multiplier + 0.45 * base_multiplier
+
+    open_resistance = clamp(float(params.get("stage_open_match_resistance", 0.45) or 0.45), 0.0, 1.0)
+    open_match_offset = max(0.0, openness_total_delta) * open_resistance * (1.0 - confidence * 0.55)
+    open_multiplier_offset = open_match_offset / max(baseline_total, 0.1)
+    if multiplier < 1.0:
+        multiplier = min(1.0, multiplier + open_multiplier_offset)
+    multiplier = clamp(multiplier, 0.78, 1.16)
+    notes = []
+    if avg_total_goals is None:
+        notes.append("No completed same-stage sample; stage multiplier stays neutral.")
+    else:
+        notes.append(
+            f"Same-stage completed sample {sample_size}, avg total goals {avg_total_goals:.2f}, confidence {confidence:.2f}."
+        )
+    if open_match_offset > 0.03 and multiplier < 1.0:
+        notes.append("Current matchup openness offsets part of the conservative stage prior.")
+    return {
+        "family": family,
+        "base_multiplier": base_multiplier,
+        "data_multiplier": data_multiplier,
+        "multiplier": multiplier,
+        "sample_size": sample_size,
+        "avg_total_goals": avg_total_goals,
+        "confidence": confidence,
+        "open_match_offset": open_match_offset,
+        "notes": notes,
+    }
+
+
+def softmax_three(edge_a: float, draw_score: float, edge_b: float) -> dict[str, float]:
+    values = {
+        "team_a_win": edge_a,
+        "draw": draw_score,
+        "team_b_win": edge_b,
+    }
+    max_value = max(values.values())
+    exp_values = {key: math.exp(value - max_value) for key, value in values.items()}
+    total = sum(exp_values.values())
+    return {key: value / total for key, value in exp_values.items()}
+
+
+def strength_wdl_prior(
+    strength_a: dict,
+    strength_b: dict,
+    attack_edge_a: float,
+    attack_edge_b: float,
+    style_delta_a: float,
+    style_delta_b: float,
+    tactic_a: float,
+    tactic_b: float,
+    formation_a_delta: float,
+    formation_b_delta: float,
+    manual_a: float,
+    manual_b: float,
+    home_a: float,
+    home_b: float,
+    openness_total_delta: float,
+    stage_kind: str,
+    stage_context: dict,
+) -> dict[str, float]:
+    """First-stage WDL prior from team features, before exact-score calibration."""
+    overall_edge = (float(strength_a["overall_rating"]) - float(strength_b["overall_rating"])) / 100.0
+    form_edge = (float(strength_a["form_rating"]) - float(strength_b["form_rating"])) / 100.0
+    defense_edge_a = (float(strength_a["defense_rating"]) - float(strength_b["attack_rating"])) / 100.0
+    defense_edge_b = (float(strength_b["defense_rating"]) - float(strength_a["attack_rating"])) / 100.0
+    keeper_edge = (float(strength_a["goalkeeper_rating"]) - float(strength_b["goalkeeper_rating"])) / 100.0
+    set_piece_edge = (float(strength_a["set_piece_rating"]) - float(strength_b["set_piece_rating"])) / 100.0
+    feature_edge = (
+        2.00 * overall_edge
+        + 1.25 * (attack_edge_a - attack_edge_b)
+        + 0.72 * (defense_edge_a - defense_edge_b)
+        + 0.48 * form_edge
+        + 0.34 * keeper_edge
+        + 0.24 * set_piece_edge
+        + 1.80
+        * (
+            style_delta_a
+            - style_delta_b
+            + tactic_a
+            - tactic_b
+            + formation_a_delta
+            - formation_b_delta
+            + manual_a
+            - manual_b
+            + home_a
+            - home_b
+        )
+    )
+    uncertainty = (
+        float(strength_a.get("uncertainty") or 25.0)
+        + float(strength_b.get("uncertainty") or 25.0)
+    ) / 2.0
+    edge_shrink = clamp(1.0 - max(0.0, uncertainty - 12.0) / 55.0, 0.58, 1.0)
+    feature_edge *= edge_shrink
+    openness_draw_penalty = clamp(openness_total_delta * 0.18, -0.08, 0.10)
+    stage_multiplier = float(stage_context.get("multiplier") or 1.0)
+    stage_confidence = float(stage_context.get("confidence") or 0.0)
+    knockout_draw_bonus = clamp((1.0 - stage_multiplier) * (0.45 + 0.55 * stage_confidence), 0.0, 0.10)
+    if stage_kind == "group":
+        knockout_draw_bonus = 0.0
+    draw_score = -0.18 - 0.55 * abs(feature_edge) - openness_draw_penalty + knockout_draw_bonus
+    return softmax_three(feature_edge, draw_score, -feature_edge)
+
+
+def raw_score_grid(lambda_a: float, lambda_b: float, max_goals: int = 7) -> list[dict]:
+    rows = []
     p_a = p_d = p_b = 0.0
     for goals_a in range(max_goals + 1):
         for goals_b in range(max_goals + 1):
             prob = poisson(goals_a, lambda_a) * poisson(goals_b, lambda_b)
-            if goals_a > goals_b:
+            group = score_group_from_goals(goals_a, goals_b)
+            if group == "team_a_win":
                 p_a += prob
-            elif goals_a == goals_b:
+            elif group == "draw":
                 p_d += prob
             else:
                 p_b += prob
-            scores.append({"score": f"{goals_a}-{goals_b}", "probability": prob})
+            rows.append({"score": f"{goals_a}-{goals_b}", "group": group, "probability": prob})
     total = p_a + p_d + p_b
     if total > 0:
-        p_a, p_d, p_b = p_a / total, p_d / total, p_b / total
-        for score in scores:
-            score["probability"] = score["probability"] / total
-    top = sorted(scores, key=lambda item: item["probability"], reverse=True)[:8]
+        for row in rows:
+            row["probability"] = row["probability"] / total
+    return rows
+
+
+def aggregate_wdl(rows: list[dict]) -> dict[str, float]:
+    totals = {"team_a_win": 0.0, "draw": 0.0, "team_b_win": 0.0}
+    for row in rows:
+        totals[row["group"]] += float(row["probability"])
+    return totals
+
+
+def normalize_scores(rows: list[dict]) -> list[dict]:
+    total = sum(float(row["probability"]) for row in rows)
+    if total <= 0:
+        return rows
+    for row in rows:
+        row["probability"] = float(row["probability"]) / total
+    return rows
+
+
+def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float], params: dict) -> list[dict]:
+    current_wdl = aggregate_wdl(rows)
+    weight = clamp(float(params.get("wdl_score_calibration_weight", 0.0) or 0.0), 0.0, 1.0)
+    favorite_group = max(target_wdl.items(), key=lambda item: item[1])[0]
+    favorite_probability = float(target_wdl[favorite_group])
+    draw_probability = float(target_wdl["draw"])
+    favorite_tilt = float(params.get("favorite_score_tilt", 0.0) or 0.0)
+    draw_tilt = float(params.get("draw_score_tilt", 0.0) or 0.0)
+    calibrated = []
+    for row in rows:
+        group = row["group"]
+        current = max(current_wdl.get(group, 0.0), 1e-9)
+        target = max(float(target_wdl.get(group, current)), 1e-9)
+        multiplier = (1.0 - weight) + weight * (target / current)
+        goals_a, goals_b = [int(part) for part in row["score"].split("-", 1)]
+        margin = abs(goals_a - goals_b)
+        total_goals = goals_a + goals_b
+        if group == favorite_group and favorite_probability >= 0.42:
+            multiplier *= 1.0 + favorite_tilt * min(margin, 3) / 3.0
+        if group == "draw" and draw_probability >= 0.30:
+            multiplier *= 1.0 + draw_tilt / (1.0 + abs(total_goals - 2))
+        calibrated.append({**row, "probability": float(row["probability"]) * multiplier})
+    return normalize_scores(calibrated)
+
+
+def score_distribution(
+    lambda_a: float,
+    lambda_b: float,
+    target_wdl: dict[str, float] | None = None,
+    params: dict | None = None,
+    max_goals: int = 7,
+) -> tuple[float, float, float, list[dict], dict]:
+    rows = raw_score_grid(lambda_a, lambda_b, max_goals)
+    raw_wdl = aggregate_wdl(rows)
+    if target_wdl and params:
+        rows = calibrate_score_distribution(rows, target_wdl, params)
+    calibrated_wdl = aggregate_wdl(rows)
+    top = sorted(rows, key=lambda item: item["probability"], reverse=True)[:8]
     for item in top:
         item["probability"] = round(item["probability"], 4)
-    return p_a, p_d, p_b, top
+    return (
+        calibrated_wdl["team_a_win"],
+        calibrated_wdl["draw"],
+        calibrated_wdl["team_b_win"],
+        top,
+        {"raw_wdl": raw_wdl, "calibrated_wdl": calibrated_wdl},
+    )
 
 
 def predict(
@@ -517,6 +991,17 @@ def predict(
         manual_a, manual_b, manual_notes = manual_adjustments(conn, team_a_id, team_b_id)
         tactic_a = tactical_goal_delta(plan_a)
         tactic_b = tactical_goal_delta(plan_b)
+        openness = openness_adjustment(
+            conn,
+            team_a_id,
+            team_b_id,
+            style_a,
+            style_b,
+            plan_a,
+            plan_b,
+            formation_stats,
+            params,
+        )
 
         home_a = 0.0
         home_b = 0.0
@@ -526,8 +1011,10 @@ def predict(
             if team_b["is_host"]:
                 home_b += params["home_edge"]
 
-        knockout_drag = params["knockout_drag"] if stage and "group" not in stage.lower() else 0.0
-        lambda_a = (
+        stage_context = stage_goal_context(conn, stage, params, openness["total_delta"])
+        stage_multiplier = stage_context["multiplier"]
+        stage_kind = stage_context["family"]
+        lambda_a_base = (
             base_goals
             + params["attack_weight"] * attack_edge_a
             + params["overall_weight"] * overall_edge_a
@@ -539,9 +1026,8 @@ def predict(
             + tactic_a
             + formation_a_delta
             + home_a
-            + knockout_drag
         )
-        lambda_b = (
+        lambda_b_base = (
             base_goals
             + params["attack_weight"] * attack_edge_b
             + params["overall_weight"] * overall_edge_b
@@ -553,11 +1039,75 @@ def predict(
             + tactic_b
             + formation_b_delta
             + home_b
-            + knockout_drag
         )
+        recent_a = openness["recent_a"]
+        recent_b = openness["recent_b"]
+        attack_claim_a = max(0.20, lambda_a_base + 0.28 * attack_edge_a + 0.12 * recent_a["goals_for"])
+        attack_claim_b = max(
+            0.20,
+            lambda_b_base + 0.28 * attack_edge_b + 0.12 * recent_b["goals_for"],
+        )
+        defensive_leak_a = max(0.0, recent_a["goals_against"] - 1.15)
+        defensive_leak_b = max(0.0, recent_b["goals_against"] - 1.15)
+        attack_claim_a += 0.10 * defensive_leak_b
+        attack_claim_b += 0.10 * defensive_leak_a
+        share_a = clamp(attack_claim_a / (attack_claim_a + attack_claim_b), 0.38, 0.68)
+        openness_delta_a = openness["total_delta"] * share_a
+        openness_delta_b = openness["total_delta"] * (1.0 - share_a)
+        lambda_a = lambda_a_base + openness_delta_a
+        lambda_b = lambda_b_base + openness_delta_b
+        lambda_a_before_stage = lambda_a
+        lambda_b_before_stage = lambda_b
+        lambda_a *= stage_multiplier
+        lambda_b *= stage_multiplier
         lambda_a = clamp(lambda_a, 0.2, 3.8)
         lambda_b = clamp(lambda_b, 0.2, 3.8)
-        p_a, p_draw, p_b, top_scores = score_distribution(lambda_a, lambda_b)
+        base_rows = raw_score_grid(lambda_a, lambda_b)
+        raw_wdl = aggregate_wdl(base_rows)
+        prior_wdl = strength_wdl_prior(
+            strength_a,
+            strength_b,
+            attack_edge_a,
+            attack_edge_b,
+            style_delta_a,
+            style_delta_b,
+            tactic_a,
+            tactic_b,
+            formation_a_delta,
+            formation_b_delta,
+            manual_a,
+            manual_b,
+            home_a,
+            home_b,
+            openness["total_delta"],
+            stage_kind,
+            stage_context,
+        )
+        prior_weight = clamp(float(params.get("wdl_prior_weight", 0.65) or 0.65), 0.0, 1.0)
+        target_wdl = {
+            key: prior_weight * prior_wdl[key] + (1.0 - prior_weight) * raw_wdl[key]
+            for key in ("team_a_win", "draw", "team_b_win")
+        }
+        formation_confidence = 0.0
+        if formation_stats:
+            max_formation_weight = clamp(
+                float(params.get("formation_wdl_prior_max_weight", 0.35) or 0.35),
+                0.0,
+                0.65,
+            )
+            formation_confidence = min(float(formation_stats.get("sample_size") or 0) / 100.0, max_formation_weight)
+            target_wdl = {
+                "team_a_win": (1.0 - formation_confidence) * target_wdl["team_a_win"]
+                + formation_confidence * float(formation_stats.get("p_a_win") or target_wdl["team_a_win"]),
+                "draw": (1.0 - formation_confidence) * target_wdl["draw"]
+                + formation_confidence * float(formation_stats.get("p_draw") or target_wdl["draw"]),
+                "team_b_win": (1.0 - formation_confidence) * target_wdl["team_b_win"]
+                + formation_confidence * float(formation_stats.get("p_b_win") or target_wdl["team_b_win"]),
+            }
+            total_target = sum(target_wdl.values())
+            if total_target > 0:
+                target_wdl = {key: value / total_target for key, value in target_wdl.items()}
+        p_a, p_draw, p_b, top_scores, score_calibration = score_distribution(lambda_a, lambda_b, target_wdl, params)
 
         prediction_id = f"pred-{team_a_id.lower()}-{team_b_id.lower()}-{now_utc().replace(':', '').replace('+', '')}"
         result = {
@@ -569,12 +1119,52 @@ def predict(
             "neutral_site": neutral_site,
             "lambda_a": round(lambda_a, 3),
             "lambda_b": round(lambda_b, 3),
+            "lambda_components": {
+                team_a_id: {
+                    "base_before_openness": round(lambda_a_base, 3),
+                    "openness_delta": round(openness_delta_a, 3),
+                    "before_stage_multiplier": round(lambda_a_before_stage, 3),
+                },
+                team_b_id: {
+                    "base_before_openness": round(lambda_b_base, 3),
+                    "openness_delta": round(openness_delta_b, 3),
+                    "before_stage_multiplier": round(lambda_b_before_stage, 3),
+                },
+                "stage_multiplier": round(stage_multiplier, 3),
+                "stage_family": stage_kind,
+                "stage_context": {
+                    "base_multiplier": round(stage_context["base_multiplier"], 3),
+                    "data_multiplier": round(stage_context["data_multiplier"], 3),
+                    "sample_size": stage_context["sample_size"],
+                    "avg_total_goals": (
+                        round(stage_context["avg_total_goals"], 3)
+                        if stage_context["avg_total_goals"] is not None
+                        else None
+                    ),
+                    "confidence": round(stage_context["confidence"], 3),
+                    "open_match_offset": round(stage_context["open_match_offset"], 3),
+                    "notes": stage_context["notes"],
+                },
+            },
             "probabilities": {
                 "team_a_win": round(p_a, 4),
                 "draw": round(p_draw, 4),
                 "team_b_win": round(p_b, 4),
             },
             "top_scorelines": top_scores,
+            "score_calibration": {
+                "prior_wdl": {key: round(value, 4) for key, value in prior_wdl.items()},
+                "target_wdl": {key: round(value, 4) for key, value in target_wdl.items()},
+                "raw_wdl": {key: round(value, 4) for key, value in score_calibration["raw_wdl"].items()},
+                "calibrated_wdl": {
+                    key: round(value, 4) for key, value in score_calibration["calibrated_wdl"].items()
+                },
+                "prior_weight": prior_weight,
+                "formation_prior_weight": round(formation_confidence, 4),
+                "weight": params["wdl_score_calibration_weight"],
+                "favorite_tilt": params["favorite_score_tilt"],
+                "draw_tilt": params["draw_score_tilt"],
+            },
             "strength": {
                 team_a_id: {
                     "overall": strength_a["overall_rating"],
@@ -651,9 +1241,26 @@ def predict(
                 "stats": formation_stats,
                 "note": formation_note,
             },
+            "openness": {
+                "total_delta": round(openness["total_delta"], 3),
+                "recent_delta": round(openness["recent_delta"], 3),
+                "formation_delta": round(openness["formation_delta"], 3),
+                "style_delta": round(openness["style_delta"], 3),
+                "tactical_delta": round(openness["tactical_delta"], 3),
+                "recent_total_goals": round(openness["recent_total_goals"], 3),
+                "formation_total_goals": (
+                    round(openness["formation_total_goals"], 3)
+                    if openness["formation_total_goals"] is not None
+                    else None
+                ),
+                "formation_sample": openness["formation_sample"],
+                "tactical_risk_average": round(openness["tactical_risk_average"], 1),
+                "notes": openness["notes"],
+            },
             "matchup_notes": {
                 team_a_id: style_notes_a,
                 team_b_id: style_notes_b,
+                "openness": openness["notes"],
                 "manual": manual_notes + ([formation_note] if formation_note else []),
             },
             "data_readiness": {
@@ -822,6 +1429,39 @@ def format_report(result: dict) -> str:
         "Expected goals:",
         f"- {team_a}: {result['lambda_a']:.2f}",
         f"- {team_b}: {result['lambda_b']:.2f}",
+        (
+            f"- stage balance: {result['lambda_components']['stage_family']} "
+            f"adaptive multiplier {result['lambda_components']['stage_multiplier']:.2f} "
+            f"(base {result['lambda_components']['stage_context']['base_multiplier']:.2f}, "
+            f"data {result['lambda_components']['stage_context']['data_multiplier']:.2f}, "
+            f"sample {result['lambda_components']['stage_context']['sample_size']})"
+        ),
+        (
+            "Score/WDL calibration: "
+            f"prior {pct(result['score_calibration']['prior_wdl']['team_a_win'])}/"
+            f"{pct(result['score_calibration']['prior_wdl']['draw'])}/"
+            f"{pct(result['score_calibration']['prior_wdl']['team_b_win'])}, "
+            f"raw {pct(result['score_calibration']['raw_wdl']['team_a_win'])}/"
+            f"{pct(result['score_calibration']['raw_wdl']['draw'])}/"
+            f"{pct(result['score_calibration']['raw_wdl']['team_b_win'])}, "
+            f"calibrated {pct(result['score_calibration']['calibrated_wdl']['team_a_win'])}/"
+            f"{pct(result['score_calibration']['calibrated_wdl']['draw'])}/"
+            f"{pct(result['score_calibration']['calibrated_wdl']['team_b_win'])}"
+        ),
+        "",
+        "Match openness:",
+        (
+            f"- total lambda adjustment {result['openness']['total_delta']:+.2f} "
+            f"(recent {result['openness']['recent_delta']:+.2f}, "
+            f"formation {result['openness']['formation_delta']:+.2f}, "
+            f"style {result['openness']['style_delta']:+.2f}, "
+            f"tactical {result['openness']['tactical_delta']:+.2f})"
+        ),
+        (
+            f"- recent total-goal signal {result['openness']['recent_total_goals']:.2f}; "
+            f"formation total-goal prior "
+            f"{result['openness']['formation_total_goals'] if result['openness']['formation_total_goals'] is not None else 'n/a'}"
+        ),
         "",
         "Top 8 score probabilities:",
     ]
@@ -876,6 +1516,9 @@ def format_report(result: dict) -> str:
         lines.extend(notes)
     else:
         lines.append("- No specific matchup adjustment is currently stored; result is driven by baseline squad/profile ratings.")
+    openness_notes = result.get("openness", {}).get("notes") or []
+    if openness_notes:
+        lines.extend([f"- openness: {value}" for value in openness_notes])
 
     lines.extend(
         [

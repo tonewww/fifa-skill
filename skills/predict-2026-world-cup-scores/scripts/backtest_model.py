@@ -8,7 +8,7 @@ import json
 import math
 from pathlib import Path
 
-from common import MODEL_VERSION, connect, now_utc, slugify
+from common import MODEL_VERSION, connect, now_utc, slugify, table_exists
 from predict_match import predict
 
 
@@ -46,7 +46,40 @@ def calibration_bucket(probability: float) -> str:
     return f"{lower:.1f}-{upper:.1f}"
 
 
-def completed_fixtures(conn, test_start: str | None, test_end: str | None) -> list[dict]:
+def completed_fixtures(conn, test_start: str | None, test_end: str | None, use_training_cache: bool = False) -> list[dict]:
+    if use_training_cache and table_exists(conn, "training_matches"):
+        filters = [
+            "domain = 'international'",
+            "team_a_id IS NOT NULL",
+            "team_b_id IS NOT NULL",
+            "score_a IS NOT NULL",
+            "score_b IS NOT NULL",
+        ]
+        params: list[str] = []
+        if test_start:
+            filters.append("date(match_date) >= date(?)")
+            params.append(test_start)
+        if test_end:
+            filters.append("date(match_date) <= date(?)")
+            params.append(test_end)
+        rows = conn.execute(
+            f"""
+            SELECT
+                training_match_id AS match_id,
+                match_date,
+                stage,
+                team_a_id,
+                team_b_id,
+                score_a,
+                score_b,
+                sample_weight
+            FROM training_matches
+            WHERE {' AND '.join(filters)}
+            ORDER BY match_date, training_match_id
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
     filters = [
         "team_a_id IS NOT NULL",
         "team_b_id IS NOT NULL",
@@ -70,14 +103,14 @@ def completed_fixtures(conn, test_start: str | None, test_end: str | None) -> li
         """,
         params,
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [{**dict(row), "sample_weight": 1.0} for row in rows]
 
 
-def backtest(db_path: Path, test_start: str | None, test_end: str | None, stage: str) -> dict:
+def backtest(db_path: Path, test_start: str | None, test_end: str | None, stage: str, use_training_cache: bool) -> dict:
     conn = connect(db_path)
     run_at = now_utc()
     run_id = f"backtest-{slugify(run_at)}"
-    rows = completed_fixtures(conn, test_start, test_end)
+    rows = completed_fixtures(conn, test_start, test_end, use_training_cache)
     ensure_backtest_columns(conn)
     metrics = {
         "brier_score": 0.0,
@@ -90,8 +123,12 @@ def backtest(db_path: Path, test_start: str | None, test_end: str | None, stage:
     }
     calibration: dict[str, dict[str, float]] = {}
     stored = []
+    total_weight = 0.0
     try:
         for row in rows:
+            weight = max(float(row.get("sample_weight") or 1.0), 0.0)
+            if weight <= 0:
+                continue
             result = predict(
                 db_path,
                 row["team_a_id"],
@@ -109,34 +146,37 @@ def backtest(db_path: Path, test_start: str | None, test_end: str | None, stage:
                 bucket,
                 {"sample_size": 0.0, "avg_confidence": 0.0, "hit_rate": 0.0, "avg_actual_probability": 0.0},
             )
-            calibration[bucket]["sample_size"] += 1.0
-            calibration[bucket]["avg_confidence"] += float(favorite_probability)
-            calibration[bucket]["hit_rate"] += 1.0 if favorite_outcome == actual else 0.0
-            calibration[bucket]["avg_actual_probability"] += actual_probability
+            calibration[bucket]["sample_size"] += weight
+            calibration[bucket]["avg_confidence"] += float(favorite_probability) * weight
+            calibration[bucket]["hit_rate"] += (1.0 if favorite_outcome == actual else 0.0) * weight
+            calibration[bucket]["avg_actual_probability"] += actual_probability * weight
             top_scores = result["top_scorelines"]
             actual_score = f"{row['score_a']}-{row['score_b']}"
-            metrics["brier_score"] += brier(probabilities, actual)
-            metrics["log_loss"] += safe_log_loss(actual_probability)
-            metrics["mae_goals"] += (abs(float(result["lambda_a"]) - row["score_a"]) + abs(float(result["lambda_b"]) - row["score_b"])) / 2
-            metrics["exact_score_accuracy"] += 1.0 if top_scores and top_scores[0]["score"] == actual_score else 0.0
-            metrics["top8_score_hit_rate"] += 1.0 if any(item["score"] == actual_score for item in top_scores) else 0.0
-            metrics["favorite_accuracy"] += 1.0 if favorite_outcome == actual else 0.0
-            metrics["avg_actual_outcome_probability"] += actual_probability
+            metrics["brier_score"] += brier(probabilities, actual) * weight
+            metrics["log_loss"] += safe_log_loss(actual_probability) * weight
+            metrics["mae_goals"] += (
+                (abs(float(result["lambda_a"]) - row["score_a"]) + abs(float(result["lambda_b"]) - row["score_b"])) / 2
+            ) * weight
+            metrics["exact_score_accuracy"] += (1.0 if top_scores and top_scores[0]["score"] == actual_score else 0.0) * weight
+            metrics["top8_score_hit_rate"] += (1.0 if any(item["score"] == actual_score for item in top_scores) else 0.0) * weight
+            metrics["favorite_accuracy"] += (1.0 if favorite_outcome == actual else 0.0) * weight
+            metrics["avg_actual_outcome_probability"] += actual_probability * weight
+            total_weight += weight
             stored.append((row, result, actual, actual_score))
 
         sample_size = len(stored)
-        if sample_size:
+        if total_weight:
             for key in metrics:
-                metrics[key] = metrics[key] / sample_size
+                metrics[key] = metrics[key] / total_weight
         calibration_summary = {}
         for bucket, stats in sorted(calibration.items()):
-            bucket_size = int(stats["sample_size"])
-            if bucket_size:
+            bucket_weight = float(stats["sample_size"])
+            if bucket_weight:
                 calibration_summary[bucket] = {
-                    "sample_size": bucket_size,
-                    "avg_confidence": round(stats["avg_confidence"] / bucket_size, 4),
-                    "hit_rate": round(stats["hit_rate"] / bucket_size, 4),
-                    "avg_actual_outcome_probability": round(stats["avg_actual_probability"] / bucket_size, 4),
+                    "sample_weight": round(bucket_weight, 3),
+                    "avg_confidence": round(stats["avg_confidence"] / bucket_weight, 4),
+                    "hit_rate": round(stats["hit_rate"] / bucket_weight, 4),
+                    "avg_actual_outcome_probability": round(stats["avg_actual_probability"] / bucket_weight, 4),
                 }
 
         conn.execute(
@@ -163,7 +203,10 @@ def backtest(db_path: Path, test_start: str | None, test_end: str | None, stage:
                 metrics["favorite_accuracy"],
                 metrics["avg_actual_outcome_probability"],
                 json.dumps(calibration_summary, ensure_ascii=True),
-                "Backtest uses current available snapshots/enhancements; for strict historical testing use archived pre-match data.",
+                (
+                    "Backtest uses current available snapshots/enhancements; for strict historical testing use archived pre-match data. "
+                    f"use_training_cache={use_training_cache}, total_sample_weight={total_weight:.3f}."
+                ),
             ),
         )
         for row, result, actual, _actual_score in stored:
@@ -198,7 +241,13 @@ def backtest(db_path: Path, test_start: str | None, test_end: str | None, stage:
                 ),
             )
         conn.commit()
-        return {"run_id": run_id, "sample_size": sample_size, **metrics, "calibration": calibration_summary}
+        return {
+            "run_id": run_id,
+            "sample_size": sample_size,
+            "total_sample_weight": round(total_weight, 3),
+            **metrics,
+            "calibration": calibration_summary,
+        }
     finally:
         conn.close()
 
@@ -209,9 +258,10 @@ def main() -> None:
     parser.add_argument("--test-start", help="Inclusive date filter, YYYY-MM-DD.")
     parser.add_argument("--test-end", help="Inclusive date filter, YYYY-MM-DD.")
     parser.add_argument("--stage", default="Group Stage", help="Fallback stage when fixture stage is empty.")
+    parser.add_argument("--use-training-cache", action="store_true", help="Read weighted international rows from training_matches.")
     args = parser.parse_args()
 
-    result = backtest(Path(args.db), args.test_start, args.test_end, args.stage)
+    result = backtest(Path(args.db), args.test_start, args.test_end, args.stage, args.use_training_cache)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

@@ -49,12 +49,15 @@ DDL = [
     """
     CREATE TABLE IF NOT EXISTS players (
         player_id TEXT PRIMARY KEY,
+        unified_player_id TEXT,
         team_id TEXT NOT NULL REFERENCES teams(team_id) ON DELETE CASCADE,
         fifa_code TEXT,
         name TEXT NOT NULL,
         display_name TEXT,
         shirt_number INTEGER,
         position TEXT,
+        national_team_position TEXT,
+        club_position TEXT,
         club TEXT,
         league TEXT,
         birth_date TEXT,
@@ -72,6 +75,15 @@ DDL = [
         rating_set_piece REAL,
         rating_goalkeeping REAL,
         rating_fitness REAL,
+        feature_pressing REAL,
+        feature_progression REAL,
+        feature_box_presence REAL,
+        feature_shot_quality REAL,
+        feature_key_passing REAL,
+        feature_duel_activity REAL,
+        feature_defensive_activity REAL,
+        feature_sample_minutes REAL,
+        feature_source_weight REAL,
         status TEXT DEFAULT 'available',
         minutes_expected REAL,
         last_verified_at TEXT,
@@ -250,6 +262,26 @@ DDL = [
         fitness_weight REAL DEFAULT 0.12,
         style_weight REAL DEFAULT 1.00,
         formation_weight REAL DEFAULT 0.25,
+        openness_baseline_total REAL DEFAULT 2.55,
+        recent_goal_openness_weight REAL DEFAULT 0.28,
+        formation_openness_weight REAL DEFAULT 0.38,
+        style_openness_weight REAL DEFAULT 0.20,
+        tactical_openness_weight REAL DEFAULT 0.14,
+        openness_max_delta REAL DEFAULT 0.95,
+        stage_group_goal_multiplier REAL DEFAULT 1.00,
+        stage_round32_goal_multiplier REAL DEFAULT 1.00,
+        stage_round16_goal_multiplier REAL DEFAULT 1.00,
+        stage_quarter_goal_multiplier REAL DEFAULT 1.00,
+        stage_semi_goal_multiplier REAL DEFAULT 1.00,
+        stage_final_goal_multiplier REAL DEFAULT 1.00,
+        stage_data_weight REAL DEFAULT 0.70,
+        stage_sample_half_life REAL DEFAULT 36.00,
+        stage_open_match_resistance REAL DEFAULT 0.45,
+        wdl_prior_weight REAL DEFAULT 0.65,
+        formation_wdl_prior_max_weight REAL DEFAULT 0.35,
+        wdl_score_calibration_weight REAL DEFAULT 0.70,
+        favorite_score_tilt REAL DEFAULT 0.10,
+        draw_score_tilt REAL DEFAULT 0.08,
         notes TEXT
     )
     """,
@@ -384,6 +416,288 @@ DDL = [
         notes TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS training_matches (
+        training_match_id TEXT PRIMARY KEY,
+        source_table TEXT NOT NULL,
+        source_match_id TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        competition TEXT,
+        competition_family TEXT,
+        match_date TEXT,
+        stage TEXT,
+        team_a_id TEXT,
+        team_b_id TEXT,
+        team_a_name TEXT,
+        team_b_name TEXT,
+        score_a INTEGER,
+        score_b INTEGER,
+        xg_a REAL,
+        xg_b REAL,
+        shots_a INTEGER,
+        shots_b INTEGER,
+        neutral_site INTEGER DEFAULT 1,
+        is_world_cup INTEGER DEFAULT 0,
+        is_knockout INTEGER DEFAULT 0,
+        data_quality REAL,
+        sample_weight REAL DEFAULT 1.0,
+        source_id TEXT REFERENCES sources(source_id),
+        imported_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_competitions (
+        club_competition_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_competition_id TEXT,
+        provider_season_id TEXT,
+        country TEXT,
+        competition_name TEXT,
+        season_name TEXT,
+        gender TEXT,
+        is_international INTEGER DEFAULT 0,
+        match_available TEXT,
+        metadata_json TEXT,
+        source_id TEXT REFERENCES sources(source_id),
+        imported_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_teams (
+        club_team_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_team_id TEXT,
+        name TEXT NOT NULL,
+        country TEXT,
+        gender TEXT,
+        source_id TEXT REFERENCES sources(source_id),
+        imported_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_players (
+        club_player_id TEXT PRIMARY KEY,
+        unified_player_id TEXT,
+        provider TEXT NOT NULL,
+        provider_player_id TEXT,
+        name TEXT NOT NULL,
+        nickname TEXT,
+        country TEXT,
+        primary_position TEXT,
+        source_id TEXT REFERENCES sources(source_id),
+        imported_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS unified_players (
+        unified_player_id TEXT PRIMARY KEY,
+        canonical_name TEXT NOT NULL,
+        display_name TEXT,
+        birth_date TEXT,
+        primary_national_team_id TEXT REFERENCES teams(team_id),
+        primary_position TEXT,
+        dominant_foot TEXT,
+        height_cm INTEGER,
+        source_id TEXT REFERENCES sources(source_id),
+        created_at TEXT,
+        updated_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS player_identity_links (
+        link_id TEXT PRIMARY KEY,
+        unified_player_id TEXT NOT NULL REFERENCES unified_players(unified_player_id) ON DELETE CASCADE,
+        source_table TEXT NOT NULL,
+        source_player_id TEXT NOT NULL,
+        provider TEXT,
+        team_id TEXT REFERENCES teams(team_id),
+        club_team_id TEXT REFERENCES club_teams(club_team_id),
+        confidence REAL,
+        match_method TEXT,
+        verified INTEGER DEFAULT 0,
+        created_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS player_feature_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        unified_player_id TEXT NOT NULL REFERENCES unified_players(unified_player_id) ON DELETE CASCADE,
+        player_id TEXT REFERENCES players(player_id) ON DELETE SET NULL,
+        team_id TEXT REFERENCES teams(team_id) ON DELETE SET NULL,
+        provider TEXT NOT NULL,
+        snapshot_date TEXT NOT NULL,
+        sample_minutes REAL,
+        source_weight REAL,
+        pressing_score REAL,
+        progression_score REAL,
+        box_presence_score REAL,
+        shot_quality_score REAL,
+        key_passing_score REAL,
+        duel_activity_score REAL,
+        defensive_activity_score REAL,
+        xg_per90 REAL,
+        shots_per90 REAL,
+        key_passes_per90 REAL,
+        pressures_per90 REAL,
+        carries_per90 REAL,
+        dribbles_per90 REAL,
+        touches_box_per90 REAL,
+        duels_per90 REAL,
+        def_actions_per90 REAL,
+        source_id TEXT REFERENCES sources(source_id),
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_matches (
+        club_match_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_match_id TEXT,
+        club_competition_id TEXT REFERENCES club_competitions(club_competition_id) ON DELETE CASCADE,
+        match_date TEXT,
+        kick_off TEXT,
+        stage TEXT,
+        round_name TEXT,
+        season_name TEXT,
+        home_team_id TEXT REFERENCES club_teams(club_team_id),
+        away_team_id TEXT REFERENCES club_teams(club_team_id),
+        home_score INTEGER,
+        away_score INTEGER,
+        match_status TEXT,
+        match_week INTEGER,
+        metadata_json TEXT,
+        source_id TEXT REFERENCES sources(source_id),
+        imported_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_lineups (
+        club_lineup_id TEXT PRIMARY KEY,
+        club_match_id TEXT NOT NULL REFERENCES club_matches(club_match_id) ON DELETE CASCADE,
+        club_team_id TEXT NOT NULL REFERENCES club_teams(club_team_id) ON DELETE CASCADE,
+        formation TEXT,
+        source_id TEXT REFERENCES sources(source_id),
+        imported_at TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_lineup_players (
+        club_lineup_player_id TEXT PRIMARY KEY,
+        club_lineup_id TEXT NOT NULL REFERENCES club_lineups(club_lineup_id) ON DELETE CASCADE,
+        club_player_id TEXT NOT NULL REFERENCES club_players(club_player_id) ON DELETE CASCADE,
+        club_team_id TEXT REFERENCES club_teams(club_team_id) ON DELETE CASCADE,
+        player_name TEXT,
+        jersey_number INTEGER,
+        position TEXT,
+        is_starter INTEGER DEFAULT 0,
+        minutes_played REAL,
+        source_id TEXT REFERENCES sources(source_id),
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_team_match_stats (
+        stat_id TEXT PRIMARY KEY,
+        club_match_id TEXT NOT NULL REFERENCES club_matches(club_match_id) ON DELETE CASCADE,
+        club_team_id TEXT NOT NULL REFERENCES club_teams(club_team_id) ON DELETE CASCADE,
+        opponent_club_team_id TEXT REFERENCES club_teams(club_team_id),
+        is_home INTEGER DEFAULT 0,
+        goals INTEGER,
+        shots INTEGER,
+        xg REAL,
+        shots_on_target INTEGER,
+        passes INTEGER,
+        completed_passes INTEGER,
+        passes_under_pressure INTEGER,
+        carries INTEGER,
+        dribbles INTEGER,
+        pressures INTEGER,
+        counterpressures INTEGER,
+        duels INTEGER,
+        interceptions INTEGER,
+        blocks INTEGER,
+        clearances INTEGER,
+        fouls_committed INTEGER,
+        fouls_won INTEGER,
+        corners INTEGER,
+        crosses INTEGER,
+        deep_progressions INTEGER,
+        touches_box INTEGER,
+        set_piece_shots INTEGER,
+        open_play_shots INTEGER,
+        possession_events INTEGER,
+        source_id TEXT REFERENCES sources(source_id),
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_player_match_stats (
+        stat_id TEXT PRIMARY KEY,
+        club_match_id TEXT NOT NULL REFERENCES club_matches(club_match_id) ON DELETE CASCADE,
+        club_team_id TEXT REFERENCES club_teams(club_team_id) ON DELETE CASCADE,
+        club_player_id TEXT NOT NULL REFERENCES club_players(club_player_id) ON DELETE CASCADE,
+        player_name TEXT,
+        position TEXT,
+        minutes_played REAL,
+        goals INTEGER,
+        shots INTEGER,
+        xg REAL,
+        passes INTEGER,
+        completed_passes INTEGER,
+        key_passes INTEGER,
+        assists INTEGER,
+        carries INTEGER,
+        dribbles INTEGER,
+        pressures INTEGER,
+        counterpressures INTEGER,
+        duels INTEGER,
+        interceptions INTEGER,
+        blocks INTEGER,
+        clearances INTEGER,
+        fouls_committed INTEGER,
+        fouls_won INTEGER,
+        under_pressure_events INTEGER,
+        touches_box INTEGER,
+        source_id TEXT REFERENCES sources(source_id),
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS club_player_feature_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        club_player_id TEXT NOT NULL REFERENCES club_players(club_player_id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        snapshot_date TEXT NOT NULL,
+        sample_matches INTEGER,
+        minutes_played REAL,
+        goals_per90 REAL,
+        xg_per90 REAL,
+        shots_per90 REAL,
+        passes_per90 REAL,
+        pass_completion_pct REAL,
+        key_passes_per90 REAL,
+        pressures_per90 REAL,
+        carries_per90 REAL,
+        dribbles_per90 REAL,
+        duels_per90 REAL,
+        def_actions_per90 REAL,
+        touches_box_per90 REAL,
+        attacking_score REAL,
+        possession_score REAL,
+        defensive_score REAL,
+        transition_score REAL,
+        source_id TEXT REFERENCES sources(source_id),
+        notes TEXT
+    )
+    """,
 ]
 
 
@@ -402,6 +716,22 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_style_team_date ON team_style_profiles(team_id, profile_date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_strength_team_date ON team_strength_snapshots(team_id, rating_date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_fixtures_teams ON fixtures(team_a_id, team_b_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_training_matches_source ON training_matches(source_table, source_match_id)",
+    "CREATE INDEX IF NOT EXISTS idx_training_matches_date ON training_matches(match_date)",
+    "CREATE INDEX IF NOT EXISTS idx_training_matches_domain_weight ON training_matches(domain, sample_weight)",
+    "CREATE INDEX IF NOT EXISTS idx_club_matches_competition ON club_matches(club_competition_id, match_date)",
+    "CREATE INDEX IF NOT EXISTS idx_club_matches_teams ON club_matches(home_team_id, away_team_id)",
+    "CREATE INDEX IF NOT EXISTS idx_club_lineups_match_team ON club_lineups(club_match_id, club_team_id)",
+    "CREATE INDEX IF NOT EXISTS idx_club_lineup_players_player ON club_lineup_players(club_player_id)",
+    "CREATE INDEX IF NOT EXISTS idx_club_team_stats_match_team ON club_team_match_stats(club_match_id, club_team_id)",
+    "CREATE INDEX IF NOT EXISTS idx_club_player_stats_player ON club_player_match_stats(club_player_id)",
+    "CREATE INDEX IF NOT EXISTS idx_club_player_features_player_date ON club_player_feature_snapshots(club_player_id, snapshot_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_players_unified ON players(unified_player_id)",
+    "CREATE INDEX IF NOT EXISTS idx_club_players_unified ON club_players(unified_player_id)",
+    "CREATE INDEX IF NOT EXISTS idx_identity_links_unified ON player_identity_links(unified_player_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_links_source ON player_identity_links(source_table, source_player_id, provider)",
+    "CREATE INDEX IF NOT EXISTS idx_player_features_unified_date ON player_feature_snapshots(unified_player_id, snapshot_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_player_features_player_date ON player_feature_snapshots(player_id, snapshot_date DESC)",
 ]
 
 
@@ -478,7 +808,82 @@ REFERENCE_SOURCES = [
         7,
         "manual-provider",
     ),
+    (
+        "statsbomb_open_data",
+        "StatsBomb Open Data",
+        "https://github.com/statsbomb/open-data",
+        "club_events_lineups",
+        "StatsBomb",
+        90,
+        "open-data-attribution-required",
+    ),
 ]
+
+
+SCHEMA_ADDITIONS = {
+    "players": {
+        "unified_player_id": "TEXT",
+        "national_team_position": "TEXT",
+        "club_position": "TEXT",
+        "feature_pressing": "REAL",
+        "feature_progression": "REAL",
+        "feature_box_presence": "REAL",
+        "feature_shot_quality": "REAL",
+        "feature_key_passing": "REAL",
+        "feature_duel_activity": "REAL",
+        "feature_defensive_activity": "REAL",
+        "feature_sample_minutes": "REAL",
+        "feature_source_weight": "REAL",
+    },
+    "club_players": {
+        "unified_player_id": "TEXT",
+    },
+    "model_parameters": {
+        "openness_baseline_total": "REAL",
+        "recent_goal_openness_weight": "REAL",
+        "formation_openness_weight": "REAL",
+        "style_openness_weight": "REAL",
+        "tactical_openness_weight": "REAL",
+        "openness_max_delta": "REAL",
+        "stage_group_goal_multiplier": "REAL",
+        "stage_round32_goal_multiplier": "REAL",
+        "stage_round16_goal_multiplier": "REAL",
+        "stage_quarter_goal_multiplier": "REAL",
+        "stage_semi_goal_multiplier": "REAL",
+        "stage_final_goal_multiplier": "REAL",
+        "stage_data_weight": "REAL",
+        "stage_sample_half_life": "REAL",
+        "stage_open_match_resistance": "REAL",
+        "wdl_prior_weight": "REAL",
+        "formation_wdl_prior_max_weight": "REAL",
+        "wdl_score_calibration_weight": "REAL",
+        "favorite_score_tilt": "REAL",
+        "draw_score_tilt": "REAL",
+    },
+}
+
+
+def apply_schema_additions(conn) -> None:
+    for table, columns in SCHEMA_ADDITIONS.items():
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            continue
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for column, ddl_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+        if table == "players":
+            conn.execute(
+                """
+                UPDATE players
+                SET national_team_position = COALESCE(national_team_position, position)
+                WHERE position IS NOT NULL
+                  AND trim(position) <> ''
+                """
+            )
 
 
 def initialize(db_path: Path, with_sources: bool) -> None:
@@ -487,6 +892,7 @@ def initialize(db_path: Path, with_sources: bool) -> None:
     try:
         for ddl in DDL:
             conn.execute(ddl)
+        apply_schema_additions(conn)
         for index_sql in INDEXES:
             conn.execute(index_sql)
         if with_sources:
@@ -518,15 +924,27 @@ def initialize(db_path: Path, with_sources: bool) -> None:
             INSERT OR IGNORE INTO model_parameters (
                 parameter_id, model_version, as_of_date, base_goals, home_edge, knockout_drag,
                 attack_weight, overall_weight, keeper_weight, set_piece_weight, fitness_weight,
-                style_weight, formation_weight, notes
+                style_weight, formation_weight, openness_baseline_total, recent_goal_openness_weight,
+                formation_openness_weight, style_openness_weight, tactical_openness_weight,
+                openness_max_delta, stage_group_goal_multiplier, stage_round32_goal_multiplier,
+                stage_round16_goal_multiplier, stage_quarter_goal_multiplier, stage_semi_goal_multiplier,
+                stage_final_goal_multiplier, stage_data_weight, stage_sample_half_life,
+                stage_open_match_resistance, wdl_prior_weight, formation_wdl_prior_max_weight,
+                wdl_score_calibration_weight, favorite_score_tilt, draw_score_tilt, notes
             )
-            VALUES (?, ?, ?, 1.22, 0.12, -0.07, 0.85, 0.55, 0.25, 0.18, 0.12, 1.00, 0.25, ?)
+            VALUES (?, ?, ?, 1.22, 0.12, -0.07, 0.85, 0.55, 0.25, 0.18, 0.12,
+                    1.00, 0.25, 2.55, 0.28, 0.38, 0.20, 0.14, 0.95,
+                    1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.70, 36.00, 0.45,
+                    0.65, 0.35, 0.70, 0.10, 0.08, ?)
             """,
             (
                 f"params-{MODEL_VERSION}-default",
                 MODEL_VERSION,
-                "2026-06-20",
-                "Seed default parameters. Replace with optimized rows after backtesting completed fixtures.",
+                "2026-06-21",
+                (
+                    "Seed default parameters with openness, WDL-to-score calibration, and adaptive stage goal context. "
+                    "Replace with optimized rows after backtesting completed fixtures."
+                ),
             ),
         )
         conn.commit()

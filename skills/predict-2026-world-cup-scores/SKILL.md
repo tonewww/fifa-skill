@@ -51,6 +51,26 @@ python3 skills/predict-2026-world-cup-scores/scripts/ingest_fifa_rankings.py --d
 python3 skills/predict-2026-world-cup-scores/scripts/apply_enhancements.py --db data/worldcup2026.sqlite
 ```
 
+   - Import public club/league event data when richer player-role, tactical, pressing, xG, and per-90 features are needed for model training. StatsBomb Open Data is attribution-required open data; use it for feature-behavior training, not as a direct national-team strength replacement.
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/ingest_statsbomb_open_data.py --db data/worldcup2026.sqlite --competition-id 9 --season-id 281 --max-matches 20 --male-only --club-only
+```
+
+   - After importing international results and optional club/event data, build a persistent weighted training cache. This avoids repeatedly scanning raw sources during training and gives FIFA World Cup main-tournament results slightly higher sample weight than qualifiers, friendlies, and club/league cups.
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/build_training_dataset.py --db data/worldcup2026.sqlite --since 2018-01-01 --until 2026-06-21 --include-club --replace
+```
+
+   - After importing club data, unify provider club players with World Cup squad players and merge club-derived role features at low weight. This writes canonical links to `unified_players` / `player_identity_links`, keeps detailed role traits in `player_feature_snapshots`, adds low-weight rows to `player_ratings`, optionally caches the feature priors on `players`, and blends team-level role signals into `team_style_profiles`.
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/merge_club_player_features.py --db data/worldcup2026.sqlite --min-link-confidence 0.70 --min-feature-minutes 90 --player-feature-weight 0.18 --team-style-weight 0.12 --rating-date 2026-06-21 --profile-date 2026-06-21 --apply-to-players
+```
+
+   - Treat auto-linked club players as unverified low-weight priors until manually reviewed. Strong role signals such as high pressing, ball progression, box presence, shot quality, key passing, duels, and defensive actions should enrich the model, not override official squads, injuries, lineups, or national-team form.
+
 5. Validate the data set.
 
 ```bash
@@ -60,6 +80,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/validate_database.py --db d
 6. Build the strength table.
    - Read [references/modeling-framework.md](references/modeling-framework.md) for weights and formulas.
    - Extract richer team features after importing squads/results/enhancements. This derives formation tendency, tempo, pressing, buildup, transition, set-piece, goalkeeper, cohesion, and a generic tactical plan from player traits and recent results.
+   - If club-role features are available, run `merge_club_player_features.py` before this step or rerun it after extraction; `club_feature_merge` profiles have priority on the same profile date.
 
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/extract_team_features.py --db data/worldcup2026.sqlite --profile-date 2026-06-20 --recent-limit 12
@@ -80,9 +101,10 @@ python3 skills/predict-2026-world-cup-scores/scripts/import_historical_results.p
 
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/analyze_formation_matchups.py --db data/worldcup2026.sqlite --min-sample 3
-python3 skills/predict-2026-world-cup-scores/scripts/backtest_model.py --db data/worldcup2026.sqlite
-python3 skills/predict-2026-world-cup-scores/scripts/optimize_model_parameters.py --db data/worldcup2026.sqlite --grid coarse --write-best
+python3 skills/predict-2026-world-cup-scores/scripts/backtest_model.py --db data/worldcup2026.sqlite --use-training-cache
+python3 skills/predict-2026-world-cup-scores/scripts/optimize_model_parameters.py --db data/worldcup2026.sqlite --grid coarse --use-training-cache --write-best
 ```
+   - The optimizer also searches WDL-prior-to-score calibration and adaptive stage/round parameters. Do not hard-code knockout score suppression; let completed same-stage samples and current matchup openness decide whether the round should lower, neutralize, or slightly raise total-goal expectation.
 
 8. Predict a match.
    - Run the script, then explain the result in the format from [references/prediction-output.md](references/prediction-output.md).
@@ -116,6 +138,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.p
 - Include matchup effects ("ke zhi"/style counters): pressing versus buildup resistance, transition speed versus high defensive line, set pieces versus aerial defense, low block versus shot creation, wing overloads versus fullback weakness, and goalkeeper profile versus crossing volume.
 - Use official lineups when available. Before official lineups, model expected lineups and apply higher uncertainty.
 - Backtest score distributions and formation matchups when enough results are available; write optimized weights to `model_parameters` rather than hard-coding them.
+- Use stage/round context as an adaptive factor. Group and knockout stages can differ, but same-stage completed results should drive the multiplier; when no same-stage evidence exists, keep the stage multiplier neutral and state the uncertainty.
 
 ## Resources
 
@@ -125,6 +148,9 @@ python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.p
 - `import_historical_results.py`: import public international result rows into `fixtures` and `team_results` for calibration/backtesting.
 - `ingest_fifa_squad_pdf.py`: parse FIFA SquadLists PDF into local 48-team and 1248-player baseline data.
 - `ingest_fifa_rankings.py`: import FIFA ranking CSVs or best-effort official ranking API responses and sync latest official ranks to teams.
+- `ingest_statsbomb_open_data.py`: import StatsBomb Open Data club competitions, matches, lineups, events, team/player match stats, and derived player feature snapshots for training tactical/player feature relationships.
+- `build_training_dataset.py`: materialize weighted `training_matches` from local fixtures and `club_matches`; World Cup main-tournament rows receive a modest higher weight, while club rows are stored as lower-weight feature/score-shape samples.
+- `merge_club_player_features.py`: unify World Cup and club provider player identities, write low-weight club-derived player feature snapshots/ratings, update player feature caches, and blend player-role traits into team style profiles.
 - `init_database.py`: create the SQLite database and source-tracking tables.
 - `import_csv.py`: import normalized CSV files into known tables.
 - `apply_enhancements.py`: apply latest player ratings, injuries, lineups, and tactical plans to baseline fields.

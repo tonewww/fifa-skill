@@ -238,6 +238,8 @@ def parse_pdf(pdf_path: Path, source_id: str, verified_at: str) -> tuple[list[di
                     "display_name": name_on_shirt or player_name,
                     "shirt_number": shirt_number,
                     "position": position,
+                    "national_team_position": position,
+                    "club_position": "",
                     "club": club,
                     "league": "",
                     "birth_date": birth_date,
@@ -303,10 +305,10 @@ def avg(items: list[float], default: float = 50.0) -> float:
 
 def style_from_players(team_id: str, team_name: str, team_players: list[dict], verified_at: str, source_id: str) -> dict:
     by_pos = {
-        "GK": [p for p in team_players if p["position"] == "GK"],
-        "DF": [p for p in team_players if p["position"] == "DF"],
-        "MF": [p for p in team_players if p["position"] == "MF"],
-        "FW": [p for p in team_players if p["position"] == "FW"],
+        "GK": [p for p in team_players if (p.get("national_team_position") or p["position"]) == "GK"],
+        "DF": [p for p in team_players if (p.get("national_team_position") or p["position"]) == "DF"],
+        "MF": [p for p in team_players if (p.get("national_team_position") or p["position"]) == "MF"],
+        "FW": [p for p in team_players if (p.get("national_team_position") or p["position"]) == "FW"],
     }
     avg_caps = avg([p["caps"] or 0 for p in team_players], 20.0)
     avg_height = avg([p["height_cm"] or 180 for p in team_players], 180.0)

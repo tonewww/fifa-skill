@@ -120,6 +120,8 @@ Useful additional features to import when available:
 
 Player ratings should use expected role weights:
 
+- Use `players.national_team_position` for squad role, formation inference, and national-team phase aggregation. Fall back to legacy `players.position` only for older data.
+- Use `players.club_position` to explain and shrink club-derived features. If club role and national-team role diverge, keep the club-derived feature weight low or require manual review before increasing it.
 - Confirmed starters: 70-100 minutes expected.
 - Likely starters: 55-85.
 - Rotation players: 20-50.
@@ -255,11 +257,35 @@ lambda = base_goals
 Defaults:
 
 - `base_goals`: 1.22 per team.
-- Knockout non-group stages reduce both lambdas slightly due to risk management.
+- Stage/round effects are adaptive. The model first reads completed same-stage fixtures from `fixtures`, estimates the stage's actual average total-goal level versus `openness_baseline_total`, and blends that evidence by sample confidence. With no same-stage sample, the stage multiplier stays neutral (`1.00`) instead of forcing a lower lambda. Configured round multipliers such as `stage_round16_goal_multiplier` default to neutral and should become non-neutral only after backtesting/optimization writes a calibrated parameter row.
 - Host edge applies only when `--non-neutral` is used and the team is marked as host.
 - `model_parameters` can override built-in expected-goals weights after optimization.
 
 The lambdas are bounded between `0.2` and `3.8`.
+
+### Match Openness Layer
+
+Starting in `wc2026-skill-v0.4`, expected goals include a separate openness adjustment after the base team lambdas are calculated. This was added after the Netherlands 5-1 Sweden post-match review exposed a low-score bias: the model saw a home-win edge but compressed the exact-score distribution toward `1-0`/`1-1`.
+
+The openness layer estimates whether the match environment should produce more or fewer total goals, using:
+
+- Recent total-goal profile from each team's latest `team_results`.
+- Formation-pair average goals from `formation_matchup_stats`.
+- Style tempo, pressing, transition attack/defense, defensive line, and chance-route volume from `team_style_profiles`.
+- Tactical `risk_level` from `tactical_plans`.
+
+The total openness delta is bounded by `openness_max_delta`, then split between teams using base attacking claim, recent goals-for, and opponent recent goals-against. This avoids blindly raising both teams equally when the better attack faces a leaking defensive profile.
+
+Use these parameters in `model_parameters`:
+
+- `openness_baseline_total`: neutral total-goal reference, default `2.55`.
+- `recent_goal_openness_weight`: weight on recent total-goal profile.
+- `formation_openness_weight`: weight on formation-pair total-goal prior.
+- `style_openness_weight`: weight on tempo/pressing/transition style signal.
+- `tactical_openness_weight`: weight on tactical risk.
+- `openness_max_delta`: maximum absolute total-goal adjustment.
+
+When exact-score odds are provided, `analyze_score_odds_parlay.py` also uses the openness signal in the published score recommendation. If the match has a strong openness signal, the selected score remains inside the WDL favorite group, but it can be moved from the low-score probability peak toward a higher-total scoreline when the higher-total candidate keeps enough probability support. This is a publishing/calibration rule, not a claim that high scores are likely.
 
 ## Layer 5: Scoreline Distribution
 
@@ -269,11 +295,31 @@ Use independent Poisson as v0:
 P(score a-b) = Pois(a, lambda_a) * Pois(b, lambda_b)
 ```
 
-Then aggregate:
+Starting in `wc2026-skill-v0.5`, the scoreline layer is explicitly tied to the first-stage WDL model:
 
-- Team A win probability.
-- Draw probability.
-- Team B win probability.
+1. Compute a WDL prior from team strength, attack/defense edges, form, goalkeeper/set-piece edge, tactical/style counters, manual matchup adjustments, lineup/injury-aware strength snapshots, and the adaptive stage context.
+2. Compute an initial exact-score grid from the expected-goals lambdas.
+3. Blend the WDL prior with the score-grid WDL and low-weight formation-pair WDL samples.
+4. Reweight exact-score probabilities by outcome group so the final top scorelines do not contradict the WDL layer.
+5. Apply small within-group tilts for favorite-margin and draw-shape calibration.
+
+Use these parameters in `model_parameters`:
+
+- `wdl_prior_weight`: how strongly the first-stage WDL prior constrains the score-grid WDL.
+- `formation_wdl_prior_max_weight`: cap for formation-pair WDL samples.
+- `wdl_score_calibration_weight`: how strongly exact-score rows are reweighted toward target WDL.
+- `favorite_score_tilt`: within-favorite-group tilt toward stronger winning margins.
+- `draw_score_tilt`: within-draw-group tilt around plausible draw totals.
+- `stage_data_weight`: how much completed same-stage goal samples influence the round multiplier.
+- `stage_sample_half_life`: sample-size half-life for stage confidence.
+- `stage_open_match_resistance`: lets current matchup openness neutralize an unsupported conservative stage prior, without using openness twice to inflate lambdas.
+
+Aggregate and report:
+
+- First-stage WDL prior.
+- Raw score-grid WDL.
+- Target WDL after prior/formation blending.
+- Calibrated WDL after exact-score reweighting.
 - Top scorelines.
 
 Limitations:
@@ -317,6 +363,13 @@ Use club matches only for feature-behavior relationships, not direct national-te
 
 - Build archetype pairs such as high press vs deep buildup, 4-3-3 vs 4-2-3-1, low block vs possession side, set-piece team vs aerially weak team.
 - Backtest whether those archetype pairs change xG, WDL rates, or exact-score frequencies in large club samples.
+- Import event-level club data into `club_*` tables with `ingest_statsbomb_open_data.py` or licensed provider CSVs. Use `club_player_feature_snapshots` for player role traits such as xG/shot volume, key passing, pressing, carrying, defensive actions, and box touches.
+- Map club players to World Cup squad players through `unified_players` and `player_identity_links`. Auto-links from name/club/position matching must remain `verified=0` until reviewed; ambiguous names should not receive high weight.
+- Run `merge_club_player_features.py` to turn linked club traits into low-weight model inputs:
+  - `player_feature_snapshots`: keeps interpretable role features such as high pressing, ball progression, box presence, shot quality, key passing, duels, and defensive actions.
+  - `player_ratings`: adds a low-weight `statsbomb-derived-low-weight` provider row that the strength table can aggregate.
+  - `players.feature_*`: caches the latest low-weight role scores for fast feature extraction when `--apply-to-players` is used.
+  - `team_style_profiles`: blends squad-level role traits into press intensity, buildup, transition attack/defense, wide/central creation, low-block attack/defense, and tempo.
 - Transfer the learned effect as a small prior into `team_style_profiles`, `formation_matchup_stats`, or `matchup_adjustments`.
 - Shrink club-derived effects aggressively unless the national-team player roles, coach style, and expected lineup match the club archetype.
 - Keep strict separation between national-team outcome calibration and club-derived tactical priors.
@@ -340,6 +393,38 @@ python3 skills/predict-2026-world-cup-scores/scripts/optimize_model_parameters.p
 ```
 
 Use `--grid smoke --max-matches 200` for quick iteration. Use `--grid full` only when runtime is acceptable.
+
+### Persistent Weighted Training Cache
+
+After importing historical international results and optional StatsBomb/licensed event data, materialize `training_matches`:
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/build_training_dataset.py --db data/worldcup2026.sqlite --since 2018-01-01 --until 2026-06-21 --include-club --replace
+```
+
+Use the cache for repeated model training:
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/backtest_model.py --db data/worldcup2026.sqlite --test-start 2021-01-01 --test-end 2026-06-21 --use-training-cache
+python3 skills/predict-2026-world-cup-scores/scripts/optimize_model_parameters.py --db data/worldcup2026.sqlite --test-start 2021-01-01 --test-end 2026-06-21 --grid smoke --max-matches 200 --use-training-cache
+```
+
+Weighting policy:
+
+- FIFA World Cup main-tournament rows: default `1.25`. These are closest to the target tournament environment, so they get modestly higher influence.
+- World Cup qualifiers: about `1.08`. Useful for national-team signal but less similar to neutral-site tournament play.
+- Continental cups: about `1.06`. Competitive and tournament-like, but not identical to the World Cup.
+- Nations League and qualifiers: around `1.00`.
+- Friendlies: around `0.72`; lineups and incentives are less reliable.
+- Club/league samples: default `0.88`; use primarily for tactical archetypes, score-shape behavior, xG/event relationships, and player-role features rather than direct national-team strength.
+- Event/xG-rich rows receive a small bonus because they can train score-shape and chance-quality behavior.
+- Knockout rows receive a small context bonus, but round conservatism should come from learned stage factors, not from a forced lambda clamp.
+
+Keep the distinction between domains:
+
+- `international`: mapped FIFA-team rows that can feed the current national-team `predict_match.py` backtests and optimization.
+- `statsbomb_international`: provider international event rows, including World Cup or Euro samples, retained with tournament-aware weights but not directly passed to `predict_match.py` until provider team IDs are mapped.
+- `club`: club samples for richer player/tactical feature learning and score-distribution calibration.
 
 ## Output Interpretation
 

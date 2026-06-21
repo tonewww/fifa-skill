@@ -10,7 +10,7 @@ import math
 import sys
 from pathlib import Path
 
-from predict_match import poisson, predict
+from predict_match import calibrate_score_distribution, predict, raw_score_grid
 
 
 DEFAULT_TEAM_MAP = {
@@ -25,18 +25,17 @@ DEFAULT_TEAM_MAP = {
 }
 
 
-def score_distribution(lambda_a: float, lambda_b: float, max_goals: int = 10) -> dict[str, float]:
-    dist = {}
-    total = 0.0
-    for goals_a in range(max_goals + 1):
-        for goals_b in range(max_goals + 1):
-            probability = poisson(goals_a, lambda_a) * poisson(goals_b, lambda_b)
-            key = f"{goals_a}:{goals_b}"
-            dist[key] = probability
-            total += probability
-    if total > 0:
-        dist = {key: value / total for key, value in dist.items()}
-    return dist
+def score_distribution(result: dict, max_goals: int = 10) -> dict[str, float]:
+    params = result.get("model_parameters") or {}
+    target_wdl = (result.get("score_calibration") or {}).get("target_wdl")
+    lambda_a = float(result["lambda_a"])
+    lambda_b = float(result["lambda_b"])
+    if target_wdl and params:
+        rows = raw_score_grid(lambda_a, lambda_b, max_goals)
+        rows = calibrate_score_distribution(rows, target_wdl, params)
+        return {row["score"].replace("-", ":"): row["probability"] for row in rows}
+    rows = raw_score_grid(lambda_a, lambda_b, max_goals)
+    return {row["score"].replace("-", ":"): row["probability"] for row in rows}
 
 
 def flatten_odds(odds: dict) -> tuple[list[dict], dict[str, float]]:
@@ -89,17 +88,76 @@ def recommendation_reason(favorite_group: str, raw_top_group: str | None, recomm
     return "No exact score inside the blended WDL favorite outcome group was available; fell back to raw top exact score."
 
 
+def score_total_goals(score: str) -> int | None:
+    if "其它" in score:
+        return None
+    try:
+        home_goals, away_goals = [int(part) for part in score.split(":", 1)]
+    except ValueError:
+        return None
+    return home_goals + away_goals
+
+
+def openness_target_total(match: dict) -> float | None:
+    openness = (match.get("prediction") or {}).get("openness") or {}
+    total_delta = float(openness.get("total_delta") or 0.0)
+    recent_total = openness.get("recent_total_goals")
+    formation_total = openness.get("formation_total_goals")
+    if total_delta < 0.35:
+        return None
+    signals = [float(value) for value in (recent_total, formation_total) if value is not None]
+    if not signals:
+        return None
+    return max(3.0, min(4.4, sum(signals) / len(signals)))
+
+
+def openness_adjusted_recommendation(aligned: list[dict], raw_recommendation: dict, match: dict) -> dict:
+    target_total = openness_target_total(match)
+    if target_total is None or not aligned:
+        return raw_recommendation
+    top_probability = float(raw_recommendation.get("blended_probability", 0.0) or 0.0)
+    if top_probability <= 0:
+        return raw_recommendation
+    minimum_total = max(3, round(target_total))
+    viable = []
+    for candidate in aligned:
+        total_goals = score_total_goals(candidate["score"])
+        if total_goals is None:
+            continue
+        probability = float(candidate.get("blended_probability", 0.0) or 0.0)
+        if probability < top_probability * 0.50:
+            continue
+        if total_goals < minimum_total:
+            continue
+        closeness = abs(total_goals - target_total)
+        probability_ratio = probability / top_probability
+        openness_score = probability_ratio - 0.20 * closeness + 0.06 * max(total_goals - 2, 0)
+        viable.append((openness_score, probability, candidate))
+    if not viable:
+        return raw_recommendation
+    viable.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return viable[0][2]
+
+
 def recommendation_analysis_note(
     favorite_group: str,
     favorite_probability: float,
     raw_top: dict,
     recommendation: dict,
     tie_count: int,
+    openness_adjusted: bool = False,
+    target_total: float | None = None,
 ) -> str:
     favorite_label = outcome_label(favorite_group)
     recommended_group = recommendation.get("group")
     raw_top_score = raw_top.get("score")
     raw_top_group = raw_top.get("group")
+    if openness_adjusted and target_total is not None and recommended_group == favorite_group:
+        return (
+            f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+            f"近期与阵型对位指向开放比赛（目标总进球约{target_total:.1f}），"
+            f"因此在{favorite_label}方向内上调到更高总进球比分。"
+        )
     if recommended_group != favorite_group:
         return (
             f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
@@ -131,7 +189,10 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         for candidate in ranked
         if candidate["group"] == favorite_group and "其它" not in candidate["score"]
     ]
-    recommendation = aligned[0] if aligned else raw_top
+    raw_recommendation = aligned[0] if aligned else raw_top
+    recommendation = openness_adjusted_recommendation(aligned, raw_recommendation, match)
+    target_total = openness_target_total(match)
+    openness_adjusted = recommendation.get("score") != raw_recommendation.get("score")
     top_probability = float(recommendation.get("blended_probability", 0.0) or 0.0)
     tied = [
         candidate
@@ -158,12 +219,17 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         raw_top,
         recommendation,
         len(score_items),
+        openness_adjusted,
+        target_total,
     )
     return {
         "favorite_group": favorite_group,
         "favorite_probability": favorite_probability,
+        "openness_adjusted": openness_adjusted,
+        "openness_target_total": target_total,
         "raw_top_score": raw_top.get("score"),
         "raw_top_group": raw_top.get("group"),
+        "raw_recommended_score": raw_recommendation.get("score"),
         "score": recommendation.get("score"),
         "group": recommendation.get("group"),
         "scores": score_items,
@@ -185,7 +251,7 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
     home_id = team_map.get(home_name, home_name)
     away_id = team_map.get(away_name, away_name)
     result = predict(db_path, home_id, away_id, "Group Stage", True, False)
-    dist = score_distribution(float(result["lambda_a"]), float(result["lambda_b"]))
+    dist = score_distribution(result)
     flat, market_wdl = flatten_odds(item["odds"])
     model_weight = 1.0 - market_weight
     model_wdl = {
@@ -266,6 +332,12 @@ def match_favorite_edge(match: dict) -> float:
     return probabilities[0] - probabilities[1]
 
 
+def match_dominant_favorite(match: dict) -> bool:
+    _favorite_group, favorite_probability = match_favorite_group(match)
+    favorite_edge = match_favorite_edge(match)
+    return favorite_probability >= 0.52 and favorite_edge >= 0.20
+
+
 def eligible_candidates(
     match: dict,
     min_leg_probability: float,
@@ -288,7 +360,7 @@ def eligible_candidates(
         favorite_probability >= strong_favorite_threshold
         or favorite_edge >= strong_favorite_edge_threshold
     )
-    if mode == "strength-aware" and is_clear_favorite and restrict_clear_favorite:
+    if mode == "strength-aware" and is_clear_favorite and (restrict_clear_favorite or match_dominant_favorite(match)):
         favorite_eligible = [candidate for candidate in eligible if candidate["group"] == favorite_group]
         if favorite_eligible:
             eligible = favorite_eligible
@@ -337,6 +409,7 @@ def build_parlays(
         is_clear_favorite = (
             favorite_probability >= strong_favorite_threshold
             or favorite_edge >= strong_favorite_edge_threshold
+            or match_dominant_favorite(match)
         )
         favorite_context.append((is_clear_favorite, favorite_group))
         eligible = eligible_candidates(
@@ -409,6 +482,7 @@ def parlay_pool(
         is_clear_favorite = (
             favorite_probability >= strong_favorite_threshold
             or favorite_edge >= strong_favorite_edge_threshold
+            or match_dominant_favorite(match)
         )
         favorite_context.append((is_clear_favorite, favorite_group))
         eligible = eligible_candidates(

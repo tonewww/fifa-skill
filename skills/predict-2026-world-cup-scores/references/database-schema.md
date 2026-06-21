@@ -41,16 +41,20 @@ One row per squad player.
 
 Minimum required fields:
 
-- `player_id`, `team_id`, `name`, `position`, `club`, `status`.
+- `player_id`, `unified_player_id`, `team_id`, `name`, `national_team_position`, `club_position`, `club`, `status`.
+- `position`: legacy compatibility field. Keep it in sync with `national_team_position` until all importers and CSVs have migrated.
 - `rating_overall`: 0-100 estimate or provider-derived value.
 - Role-specific ratings: `rating_attack`, `rating_defense`, `rating_possession`, `rating_transition`, `rating_set_piece`, `rating_goalkeeping`, `rating_fitness`.
+- Optional low-weight role-feature caches from linked club data: `feature_pressing`, `feature_progression`, `feature_box_presence`, `feature_shot_quality`, `feature_key_passing`, `feature_duel_activity`, `feature_defensive_activity`, `feature_sample_minutes`, `feature_source_weight`.
 - `minutes_expected`: projected role weight.
 
 Completion rule: usually 26 players per final squad. Fewer than 23 players is not prediction-ready.
 
 Position guidance:
 
-- Use `GK`, `DF`, `MF`, `FW` for broad grouping.
+- Use `national_team_position` for squad role, formation inference, and national-team strength aggregation.
+- Use `club_position` for provider-derived club role, player-feature interpretation, and club-to-national transfer checks.
+- Use `GK`, `DF`, `MF`, `FW` for broad national-team grouping; provider club positions can be more specific, such as `Right Wing Back`, `Center Forward`, or `Defensive Midfield`.
 - More specific roles can live in `notes`, such as `inverted fullback`, `ball-winning 6`, or `target 9`.
 
 ### `fixtures`
@@ -106,6 +110,33 @@ Fields:
 - `rating_date`.
 - 0-100 ratings: `overall`, `attack`, `defense`, `possession`, `transition`, `set_piece`, `goalkeeping`, `fitness`.
 - `market_value_eur`, `minutes_recent` when allowed.
+
+`statsbomb-derived-low-weight` rows are generated from linked club event features by `merge_club_player_features.py`. They are low-weight priors for role behavior, not a complete licensed player-rating feed.
+
+### `unified_players` and `player_identity_links`
+
+Canonical identity layer for footballers across national-team and club-provider records.
+
+Use this layer to avoid treating World Cup squad players and club-provider players as separate people:
+
+- `unified_players`: one canonical person row, seeded from official World Cup squad players or reviewed provider identities.
+- `players.unified_player_id`: national-team squad row linked to the canonical person.
+- `club_players.unified_player_id`: provider club-player row linked to the canonical person.
+- `player_identity_links`: auditable link rows with `source_table`, `source_player_id`, `provider`, `confidence`, `match_method`, and `verified`.
+
+Official squad rows can be `verified=1`. Auto-linked club-provider rows should remain `verified=0` until reviewed, and their feature impact should stay low weight.
+
+### `player_feature_snapshots`
+
+Canonical player-role feature snapshots after club-provider features have been mapped to `unified_players`.
+
+Important fields:
+
+- `provider`, `snapshot_date`, `sample_minutes`, `source_weight`.
+- Role scores: `pressing_score`, `progression_score`, `box_presence_score`, `shot_quality_score`, `key_passing_score`, `duel_activity_score`, `defensive_activity_score`.
+- Raw per-90 context: `xg_per90`, `shots_per90`, `key_passes_per90`, `pressures_per90`, `carries_per90`, `dribbles_per90`, `touches_box_per90`, `duels_per90`, `def_actions_per90`.
+
+Use this table for explanation, backtesting, and model feature enrichment. `players.feature_*` stores only the latest low-weight cache for fast aggregation.
 
 ### `injuries`
 
@@ -246,6 +277,65 @@ Important fields:
 - `base_goals`, `home_edge`, `knockout_drag`.
 - `attack_weight`, `overall_weight`, `keeper_weight`, `set_piece_weight`, `fitness_weight`.
 - `style_weight`, `formation_weight`.
+
+### `training_matches`
+
+Persistent weighted training cache built from local match tables.
+
+Use this table to avoid reloading or rescanning raw result/event sources on every backtest or optimization run. Rebuild it after importing new historical results or event-level data:
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/build_training_dataset.py --db data/worldcup2026.sqlite --since 2018-01-01 --until 2026-06-21 --include-club --replace
+```
+
+Important fields:
+
+- `source_table`, `source_match_id`: source-row lineage, unique together.
+- `domain`: `international` for mapped national-team fixtures that can feed the current national-team predictor; `statsbomb_international` for provider international event samples not yet mapped to FIFA team IDs; `club` for club/league samples.
+- `competition_family`: normalized bucket such as `world_cup`, `world_cup_qualification`, `continental_cup`, `qualifier_or_nations`, `champions_league`, `club_league`, or `friendly`.
+- `score_a`, `score_b`, optional `xg_a`, `xg_b`, `shots_a`, `shots_b`: training targets and richer chance-quality context when available.
+- `is_world_cup`, `is_knockout`, `neutral_site`: tournament/context flags.
+- `data_quality`: rough source richness signal.
+- `sample_weight`: training weight. World Cup main-tournament rows should be modestly higher than other international samples; friendlies and club samples should be lower unless used only for tactical/score-shape feature learning.
+
+Current national-team `backtest_model.py --use-training-cache` and `optimize_model_parameters.py --use-training-cache` read only `domain='international'`, because `predict_match.py` expects team IDs from `teams`. `statsbomb_international` and `club` rows remain valuable for event-feature, archetype, xG, and score-shape models, but should not be passed directly into the FIFA-team predictor until provider teams are mapped.
+
+### Club/League Training Tables
+
+Use `club_*` tables to store public or licensed club-match data for feature learning, archetype backtesting, and player-role enrichment. Keep this layer separate from national-team facts; transfer learned effects only as shrunk priors or derived player/tactical features.
+
+`club_competitions` stores provider competition-season rows, such as StatsBomb `competition_id` + `season_id`.
+
+`club_teams` and `club_players` store provider team/player identities. These are linked to World Cup squad players through `unified_players` and `player_identity_links`, not by assuming provider IDs equal national-team IDs. Link them with careful name/club review; auto-links should remain unverified until checked.
+
+`club_matches` stores club fixtures and results.
+
+`club_lineups` and `club_lineup_players` store provider lineups, positions, starters, and available minutes when known.
+
+`club_team_match_stats` stores event-derived team stats:
+
+- goals, shots, xG, shots on target
+- passes, completed passes, passes under pressure
+- carries, dribbles, pressures, counterpressures
+- duels, interceptions, blocks, clearances
+- fouls, corners, crosses, deep progressions, box touches
+- set-piece shots and open-play shots
+
+`club_player_match_stats` stores event-derived player match stats:
+
+- minutes, goals, shots, xG
+- passing, key passes, assists
+- carries, dribbles, pressures, counterpressures
+- defensive actions, duels, fouls, box touches
+
+`club_player_feature_snapshots` stores per-90 player feature summaries:
+
+- attacking: goals/xG/shots/key passes/box touches
+- possession: passing volume, pass completion, carries, dribbles
+- defensive: defensive actions, duels, pressures
+- transition: carries, pressures, dribbles
+
+StatsBomb Open Data rows require attribution when publishing analysis. Open Bundesliga 2023/2024 rows currently imported from StatsBomb can be skewed toward a subset of teams, so use them as event-feature examples and tactical priors rather than a complete league baseline unless coverage is confirmed.
 
 ### `backtest_runs` and `backtest_predictions`
 

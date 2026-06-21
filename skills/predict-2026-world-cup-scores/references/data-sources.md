@@ -101,7 +101,7 @@ Preferred extraction path:
 
 1. Download the PDF with `curl -L -o data/raw/YYYY-MM-DD/SquadLists-English.pdf URL`.
 2. Extract text with `pdftotext`, `pypdf`, `pdfplumber`, or another available PDF parser.
-3. Check that every team has expected player count and that columns such as shirt number, position, club, and date of birth survive extraction.
+3. Check that every team has expected player count and that columns such as shirt number, `national_team_position`, club, and date of birth survive extraction. When club-provider data is merged, check that `club_position` is populated separately from the national-team position.
 4. Reconcile extracted team names to `teams.team_id`.
 5. Import to `players.csv`.
 
@@ -135,6 +135,23 @@ Use this source to populate recent `team_results` and completed `fixtures` when 
 - It is suitable for calibration and sanity checks, not a substitute for strict archived pre-match data.
 - Only rows with integer final scores are imported; future `NA` score rows are skipped.
 - `fixtures` are created only when both teams map to current 2026 participants, while `team_results` are created for any mapped 2026 participant team.
+
+## Persistent Training Cache
+
+After importing or refreshing historical results and optional event-level sources, build `training_matches` so training and backtesting do not repeatedly scan raw source tables:
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/build_training_dataset.py --db data/worldcup2026.sqlite --since 2018-01-01 --until 2026-06-21 --include-club --replace
+```
+
+Use `--use-training-cache` in backtest and optimization scripts when you want weighted samples:
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/backtest_model.py --db data/worldcup2026.sqlite --use-training-cache
+python3 skills/predict-2026-world-cup-scores/scripts/optimize_model_parameters.py --db data/worldcup2026.sqlite --grid smoke --use-training-cache
+```
+
+The cache keeps source lineage in `source_table` and `source_match_id`. World Cup main-tournament results receive a modest higher weight than other international competitions, while friendlies and club/league rows are down-weighted. StatsBomb Open Data JSON is cached under `data/raw/statsbomb-open-data`; omit `--refresh` to reuse local raw files and avoid repeated downloads.
 
 ## Exact-Score Odds JSON
 

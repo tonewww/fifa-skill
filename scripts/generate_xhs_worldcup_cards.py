@@ -246,6 +246,11 @@ def score_explanation(match: dict) -> str:
     favorite_label = outcome_label(favorite_group)
     raw_top_score = recommendation.get("raw_top_score")
     raw_top_group = recommendation.get("raw_top_group")
+    if recommendation.get("openness_adjusted"):
+        target = recommendation.get("openness_target_total")
+        if target is not None:
+            return f"说明：开放度偏高，按{favorite_label}方向上调至约{float(target):.1f}球。"
+        return f"说明：开放度偏高，按{favorite_label}方向上调比分。"
     if raw_top_score and raw_top_group and raw_top_group != favorite_group:
         return f"说明：原始最高{raw_top_score}偏{outcome_label(raw_top_group)}，发布按{favorite_label}倾向优先。"
     if int(recommendation.get("tie_count") or 1) > 1:

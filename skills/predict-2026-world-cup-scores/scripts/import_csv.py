@@ -31,6 +31,9 @@ GENERATED_ID_COLUMNS = {
     "team_strength_snapshots": "snapshot_id",
     "matchup_adjustments": "adjustment_id",
     "predictions": "prediction_id",
+    "unified_players": "unified_player_id",
+    "player_identity_links": "link_id",
+    "player_feature_snapshots": "snapshot_id",
 }
 
 
@@ -46,6 +49,27 @@ def generate_id(table: str, row: dict[str, str], index: int) -> str:
                 slugify(row.get("name") or row.get("display_name") or f"player-{index}"),
             ]
         )
+    if table == "unified_players":
+        return f"player-{slugify(row.get('canonical_name') or row.get('display_name') or index)}"
+    if table == "player_identity_links":
+        raw = "|".join(
+            [
+                row.get("source_table", ""),
+                row.get("source_player_id", ""),
+                row.get("provider", ""),
+            ]
+        )
+        return f"identity-{slugify(raw or index)}"
+    if table == "player_feature_snapshots":
+        raw = "|".join(
+            [
+                row.get("provider", ""),
+                row.get("snapshot_date", ""),
+                row.get("unified_player_id", ""),
+                row.get("player_id", ""),
+            ]
+        )
+        return f"pfeature-{slugify(raw or index)}"
     if table == "fixtures":
         raw = "|".join(
             [

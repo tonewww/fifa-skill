@@ -39,6 +39,10 @@ def position_bucket(position: str | None) -> str:
     return "MF"
 
 
+def player_national_position(player: dict) -> str | None:
+    return player.get("national_team_position") or player.get("position")
+
+
 def player_weight(row: dict) -> float:
     status = str(row.get("status") or "available").lower()
     if status in {"out", "suspended", "withdrawn"}:
@@ -58,7 +62,7 @@ def weighted_position_average(players: list[dict], bucket: str, key: str, defaul
     values = [
         (rating(player, key, default), player_weight(player))
         for player in players
-        if position_bucket(player.get("position")) == bucket
+        if position_bucket(player_national_position(player)) == bucket
     ]
     return weighted_average(values, default)
 
@@ -66,6 +70,19 @@ def weighted_position_average(players: list[dict], bucket: str, key: str, defaul
 def top_average(players: list[dict], key: str, limit: int, default: float = 50.0) -> float:
     values = sorted([rating(player, key, default) for player in players if player.get(key) is not None], reverse=True)
     return average(values[:limit], default)
+
+
+def weighted_player_feature(players: list[dict], key: str, default: float = 50.0) -> float:
+    values = []
+    for player in players:
+        value = player.get(key)
+        if value is None:
+            continue
+        source_weight = player.get("feature_source_weight")
+        if source_weight is None:
+            source_weight = 0.18
+        values.append((float(value), player_weight(player) * max(float(source_weight), 0.0)))
+    return weighted_average(values, default)
 
 
 def metric(row: dict, key: str, fallback_key: str | None = None) -> float | None:
@@ -140,10 +157,10 @@ def recent_result_features(conn, team_id: str, limit: int) -> dict:
 
 
 def infer_formation(players: list[dict]) -> str:
-    outfield = [player for player in players if position_bucket(player.get("position")) != "GK"]
+    outfield = [player for player in players if position_bucket(player_national_position(player)) != "GK"]
     total_weight = sum(player_weight(player) for player in outfield) or 1.0
     shares = {
-        bucket: sum(player_weight(player) for player in outfield if position_bucket(player.get("position")) == bucket)
+        bucket: sum(player_weight(player) for player in outfield if position_bucket(player_national_position(player)) == bucket)
         / total_weight
         for bucket in ("DF", "MF", "FW")
     }
@@ -212,6 +229,13 @@ def derive_features(conn, team: dict, profile_date: str, recent_limit: int) -> d
     top_transition = top_average(players, "rating_transition", 8, 50.0)
     top_possession = top_average(players, "rating_possession", 8, 50.0)
     top_defense = top_average(players, "rating_defense", 8, 50.0)
+    feature_pressing = weighted_player_feature(players, "feature_pressing", top_transition)
+    feature_progression = weighted_player_feature(players, "feature_progression", top_possession)
+    feature_box_presence = weighted_player_feature(players, "feature_box_presence", top_attack)
+    feature_shot_quality = weighted_player_feature(players, "feature_shot_quality", top_attack)
+    feature_key_passing = weighted_player_feature(players, "feature_key_passing", top_possession)
+    feature_duel_activity = weighted_player_feature(players, "feature_duel_activity", top_defense)
+    feature_defensive_activity = weighted_player_feature(players, "feature_defensive_activity", top_defense)
 
     fw_attack = weighted_position_average(players, "FW", "rating_attack", top_attack)
     mf_possession = weighted_position_average(players, "MF", "rating_possession", top_possession)
@@ -231,19 +255,64 @@ def derive_features(conn, team: dict, profile_date: str, recent_limit: int) -> d
 
     features = {
         "formation_primary": formation,
-        "tempo": clamp(0.42 * top_transition + 0.22 * mf_possession + 0.18 * goal_diff_signal + 0.18 * chance_volume_signal),
-        "press_intensity": clamp(0.48 * mf_transition + 0.22 * fw_attack + 0.18 * top_defense + 0.12 * competitive_signal),
+        "tempo": clamp(
+            0.33 * top_transition
+            + 0.18 * mf_possession
+            + 0.15 * goal_diff_signal
+            + 0.14 * chance_volume_signal
+            + 0.20 * ((feature_pressing + feature_progression) / 2.0)
+        ),
+        "press_intensity": clamp(
+            0.38 * mf_transition
+            + 0.18 * fw_attack
+            + 0.14 * top_defense
+            + 0.10 * competitive_signal
+            + 0.20 * feature_pressing
+        ),
         "defensive_line": clamp(47.0 + (top_defense - 50.0) * 0.20 + (gk_transition - 50.0) * 0.18 + (top_transition - 50.0) * 0.12),
-        "buildup_quality": clamp(0.46 * mf_possession + 0.21 * gk_transition + 0.18 * top_possession + 0.15 * possession_signal),
-        "transition_attack": clamp(0.40 * top_transition + 0.32 * fw_attack + 0.18 * goal_diff_signal + 0.10 * chance_volume_signal),
-        "transition_defense": clamp(0.55 * df_defense + 0.25 * mf_transition + 0.20 * clean_sheet_signal),
-        "wing_play": clamp(0.46 * top_transition + 0.25 * fw_attack + 0.17 * mf_possession + 0.12 * chance_volume_signal),
-        "central_progression": clamp(0.48 * mf_possession + 0.22 * top_attack + 0.16 * top_transition + 0.14 * possession_signal),
+        "buildup_quality": clamp(
+            0.38 * mf_possession
+            + 0.18 * gk_transition
+            + 0.14 * top_possession
+            + 0.12 * possession_signal
+            + 0.18 * feature_progression
+        ),
+        "transition_attack": clamp(
+            0.32 * top_transition
+            + 0.26 * fw_attack
+            + 0.15 * goal_diff_signal
+            + 0.09 * chance_volume_signal
+            + 0.18 * feature_progression
+        ),
+        "transition_defense": clamp(0.45 * df_defense + 0.20 * mf_transition + 0.17 * clean_sheet_signal + 0.18 * feature_defensive_activity),
+        "wing_play": clamp(
+            0.37 * top_transition
+            + 0.21 * fw_attack
+            + 0.14 * mf_possession
+            + 0.10 * chance_volume_signal
+            + 0.18 * feature_box_presence
+        ),
+        "central_progression": clamp(
+            0.39 * mf_possession
+            + 0.17 * top_attack
+            + 0.12 * top_transition
+            + 0.11 * possession_signal
+            + 0.13 * feature_progression
+            + 0.08 * feature_key_passing
+        ),
         "set_piece_attack": clamp(0.50 * df_set_piece + 0.25 * (avg_height - 170.0) + 0.25 * fw_attack),
         "set_piece_defense": clamp(0.48 * df_defense + 0.25 * (avg_height - 170.0) + 0.27 * clean_sheet_signal),
         "aerial_strength": clamp(42.0 + (avg_height - 178.0) * 1.8 + (df_set_piece - 50.0) * 0.35),
-        "low_block_attack": clamp(0.40 * top_attack + 0.30 * mf_possession + 0.18 * goal_diff_signal + 0.12 * chance_volume_signal - failed_score_penalty),
-        "low_block_defense": clamp(0.58 * df_defense + 0.22 * gk_goalkeeping + 0.20 * clean_sheet_signal),
+        "low_block_attack": clamp(
+            0.32 * top_attack
+            + 0.24 * mf_possession
+            + 0.14 * goal_diff_signal
+            + 0.10 * chance_volume_signal
+            + 0.11 * feature_box_presence
+            + 0.09 * feature_shot_quality
+            - failed_score_penalty
+        ),
+        "low_block_defense": clamp(0.48 * df_defense + 0.18 * gk_goalkeeping + 0.16 * clean_sheet_signal + 0.11 * feature_defensive_activity + 0.07 * feature_duel_activity),
         "keeper_sweeper": clamp(0.65 * gk_transition + 0.35 * gk_goalkeeping),
         "keeper_shot_stopping": clamp(gk_goalkeeping),
         "injury_load": 0.0,
@@ -253,6 +322,13 @@ def derive_features(conn, team: dict, profile_date: str, recent_limit: int) -> d
         "recent_sample": recent["sample"],
         "recent_xg_diff": recent["xg_diff"],
         "recent_chance_volume": chance_volume_signal,
+        "club_feature_pressing": feature_pressing,
+        "club_feature_progression": feature_progression,
+        "club_feature_box_presence": feature_box_presence,
+        "club_feature_shot_quality": feature_shot_quality,
+        "club_feature_key_passing": feature_key_passing,
+        "club_feature_duel_activity": feature_duel_activity,
+        "club_feature_defensive_activity": feature_defensive_activity,
         "avg_age": avg_age,
         "avg_caps": avg_caps,
         "avg_height": avg_height,
@@ -349,7 +425,14 @@ def write_profile(conn, team_id: str, profile_date: str, features: dict) -> None
                 "Derived from player ratings/demographics and recent team_results; "
                 f"recent_sample={features['recent_sample']}, avg_age={features['avg_age']:.1f}, "
                 f"avg_caps={features['avg_caps']:.1f}, avg_height={features['avg_height']:.1f}, "
-                f"xg_diff={features['recent_xg_diff']:.2f}, chance_volume={features['recent_chance_volume']:.1f}."
+                f"xg_diff={features['recent_xg_diff']:.2f}, chance_volume={features['recent_chance_volume']:.1f}, "
+                f"club_role_features=pressing:{features['club_feature_pressing']:.1f}/"
+                f"progression:{features['club_feature_progression']:.1f}/"
+                f"box:{features['club_feature_box_presence']:.1f}/"
+                f"shot_quality:{features['club_feature_shot_quality']:.1f}/"
+                f"key_passing:{features['club_feature_key_passing']:.1f}/"
+                f"duels:{features['club_feature_duel_activity']:.1f}/"
+                f"def_actions:{features['club_feature_defensive_activity']:.1f}."
             ),
         ),
     )
