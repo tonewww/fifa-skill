@@ -98,6 +98,30 @@ def score_total_goals(score: str) -> int | None:
     return home_goals + away_goals
 
 
+def score_parts(score: str) -> tuple[int, int] | None:
+    if "其它" in score:
+        return None
+    try:
+        home_goals, away_goals = [int(part) for part in score.split(":", 1)]
+    except ValueError:
+        return None
+    return home_goals, away_goals
+
+
+def winner_goals(score: str, group: str) -> int | None:
+    parts = score_parts(score)
+    if parts is None:
+        return None
+    home_goals, away_goals = parts
+    if group == "home_win":
+        return home_goals
+    if group == "away_win":
+        return away_goals
+    if group == "draw":
+        return home_goals
+    return None
+
+
 def openness_target_total(match: dict) -> float | None:
     openness = (match.get("prediction") or {}).get("openness") or {}
     total_delta = float(openness.get("total_delta") or 0.0)
@@ -111,32 +135,99 @@ def openness_target_total(match: dict) -> float | None:
     return max(3.0, min(4.4, sum(signals) / len(signals)))
 
 
-def openness_adjusted_recommendation(aligned: list[dict], raw_recommendation: dict, match: dict) -> dict:
-    target_total = openness_target_total(match)
-    if target_total is None or not aligned:
-        return raw_recommendation
+def score_shape_context(match: dict, favorite_group: str) -> dict | None:
+    if favorite_group == "draw":
+        return None
+    prediction = match.get("prediction") or {}
+    openness = prediction.get("openness") or {}
+    blended_wdl = match.get("blended_wdl") or {}
+    market_wdl = match.get("market_wdl") or {}
+    favorite_probability = float(blended_wdl.get(favorite_group) or 0.0)
+    runner_up = max((float(value) for key, value in blended_wdl.items() if key != favorite_group), default=0.0)
+    favorite_edge = favorite_probability - runner_up
+    market_favorite_probability = float(market_wdl.get(favorite_group) or 0.0)
+    total_delta = float(openness.get("total_delta") or 0.0)
+    recent_total = openness.get("recent_total_goals")
+    formation_total = openness.get("formation_total_goals")
+    lambda_total = float(prediction.get("lambda_a") or 0.0) + float(prediction.get("lambda_b") or 0.0)
+    signals = [float(value) for value in (recent_total, formation_total, lambda_total) if value is not None]
+
+    if total_delta >= 0.18 or (recent_total is not None and float(recent_total) >= 3.0 and total_delta >= 0.08):
+        target_total = max(3.0, min(4.4, sum(signals) / len(signals)))
+        return {
+            "kind": "open",
+            "target_total": target_total,
+            "minimum_total": 3,
+            "minimum_winner_goals": 2,
+            "minimum_probability_ratio": 0.70,
+            "short_note": f"开放度偏高，按{outcome_label(favorite_group)}方向上调至更高总进球。",
+        }
+
+    if favorite_probability >= 0.54 or favorite_edge >= 0.22 or market_favorite_probability >= 0.75:
+        return {
+            "kind": "favorite_margin",
+            "target_total": max(2.2, min(3.2, lambda_total)),
+            "minimum_total": 2,
+            "minimum_winner_goals": 2,
+            "minimum_probability_ratio": 0.72,
+            "short_note": f"{outcome_label(favorite_group)}优势较清晰，优先考虑2球起步的胜比分。",
+        }
+
+    if lambda_total >= 2.40 and favorite_probability >= 0.42:
+        return {
+            "kind": "balanced_goals",
+            "target_total": max(2.7, min(3.4, lambda_total)),
+            "minimum_total": 3,
+            "minimum_winner_goals": 2,
+            "minimum_probability_ratio": 0.76,
+            "short_note": f"总进球中枢不低，选择{outcome_label(favorite_group)}方向内概率支撑足够的更高比分。",
+        }
+
+    return None
+
+
+def score_shape_adjusted_recommendation(
+    aligned: list[dict],
+    raw_recommendation: dict,
+    match: dict,
+    favorite_group: str,
+) -> tuple[dict, dict | None]:
+    context = score_shape_context(match, favorite_group)
+    if context is None or not aligned:
+        return raw_recommendation, None
     top_probability = float(raw_recommendation.get("blended_probability", 0.0) or 0.0)
     if top_probability <= 0:
-        return raw_recommendation
-    minimum_total = max(3, round(target_total))
+        return raw_recommendation, None
+    target_total = float(context["target_total"])
+    minimum_total = int(context["minimum_total"])
+    minimum_winner_goals = int(context["minimum_winner_goals"])
+    minimum_probability_ratio = float(context["minimum_probability_ratio"])
     viable = []
     for candidate in aligned:
         total_goals = score_total_goals(candidate["score"])
         if total_goals is None:
             continue
         probability = float(candidate.get("blended_probability", 0.0) or 0.0)
-        if probability < top_probability * 0.50:
+        if probability < top_probability * minimum_probability_ratio:
             continue
         if total_goals < minimum_total:
             continue
+        goals_for_winner = winner_goals(candidate["score"], favorite_group)
+        if goals_for_winner is None or goals_for_winner < minimum_winner_goals:
+            continue
         closeness = abs(total_goals - target_total)
         probability_ratio = probability / top_probability
-        openness_score = probability_ratio - 0.20 * closeness + 0.06 * max(total_goals - 2, 0)
-        viable.append((openness_score, probability, candidate))
+        margin_bonus = 0.04 * max(goals_for_winner - 1, 0)
+        total_bonus = 0.04 * max(total_goals - 2, 0)
+        shape_score = probability_ratio - 0.18 * closeness + margin_bonus + total_bonus
+        viable.append((shape_score, probability, candidate))
     if not viable:
-        return raw_recommendation
+        return raw_recommendation, None
     viable.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return viable[0][2]
+    selected = viable[0][2]
+    if selected.get("score") == raw_recommendation.get("score"):
+        return raw_recommendation, None
+    return selected, context
 
 
 def recommendation_analysis_note(
@@ -147,11 +238,30 @@ def recommendation_analysis_note(
     tie_count: int,
     openness_adjusted: bool = False,
     target_total: float | None = None,
+    shape_context: dict | None = None,
 ) -> str:
     favorite_label = outcome_label(favorite_group)
     recommended_group = recommendation.get("group")
     raw_top_score = raw_top.get("score")
     raw_top_group = raw_top.get("group")
+    if shape_context and recommended_group == favorite_group:
+        kind = shape_context.get("kind")
+        if kind == "open" and target_total is not None:
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+                f"近期与阵型对位指向开放比赛（目标总进球约{target_total:.1f}），"
+                f"因此在{favorite_label}方向内上调到更高总进球比分。"
+            )
+        if kind == "favorite_margin":
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+                "胜负优势与赔率结构支持2球起步的胜比分，因此避免机械落在1球小胜。"
+            )
+        if kind == "balanced_goals":
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+                "总进球中枢不低，且更高比分仍有足够概率支撑，因此上调首选比分。"
+            )
     if openness_adjusted and target_total is not None and recommended_group == favorite_group:
         return (
             f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
@@ -190,9 +300,10 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         if candidate["group"] == favorite_group and "其它" not in candidate["score"]
     ]
     raw_recommendation = aligned[0] if aligned else raw_top
-    recommendation = openness_adjusted_recommendation(aligned, raw_recommendation, match)
-    target_total = openness_target_total(match)
-    openness_adjusted = recommendation.get("score") != raw_recommendation.get("score")
+    recommendation, shape_context = score_shape_adjusted_recommendation(aligned, raw_recommendation, match, favorite_group)
+    target_total = float(shape_context["target_total"]) if shape_context else openness_target_total(match)
+    openness_adjusted = bool(shape_context and shape_context.get("kind") == "open")
+    score_shape_adjusted = recommendation.get("score") != raw_recommendation.get("score")
     top_probability = float(recommendation.get("blended_probability", 0.0) or 0.0)
     tied = [
         candidate
@@ -221,11 +332,15 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         len(score_items),
         openness_adjusted,
         target_total,
+        shape_context,
     )
     return {
         "favorite_group": favorite_group,
         "favorite_probability": favorite_probability,
         "openness_adjusted": openness_adjusted,
+        "score_shape_adjusted": score_shape_adjusted,
+        "selection_kind": shape_context.get("kind") if shape_context else None,
+        "short_note": shape_context.get("short_note") if shape_context else None,
         "openness_target_total": target_total,
         "raw_top_score": raw_top.get("score"),
         "raw_top_group": raw_top.get("group"),
@@ -823,6 +938,7 @@ def main() -> None:
         help="Maximum clear-favorite outcome deviations allowed in the EV-first four-leg group.",
     )
     parser.add_argument("--format", choices=["json", "markdown"], default="markdown")
+    parser.add_argument("--output", help="Optional path to write the JSON or Markdown result.")
     args = parser.parse_args()
 
     odds_path = Path(args.odds_json)
@@ -880,10 +996,15 @@ def main() -> None:
         "parlay_groups": parlay_groups,
     }
     if args.format == "json":
-        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-        print()
+        payload = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     else:
-        print(write_markdown(result))
+        payload = write_markdown(result) + "\n"
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(payload, encoding="utf-8")
+    else:
+        print(payload, end="")
 
 
 if __name__ == "__main__":

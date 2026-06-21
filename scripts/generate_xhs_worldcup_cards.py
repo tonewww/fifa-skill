@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REPORT_JSON = ROOT / "data/reports/odds-ev-2026-06-21.json"
+DEFAULT_REPORT_JSON = ROOT / "data/reports/odds-ev-2026-06-21.json"
 OUT_DIR = ROOT / "data/xiaohongshu"
 WIDTH = 1080
 HEIGHT = 1440
@@ -172,8 +173,15 @@ def outcome_color(group: str) -> str:
     return {"home_win": COLORS["red"], "draw": COLORS["amber"], "away_win": COLORS["teal"]}.get(group, COLORS["muted"])
 
 
-def card_wdl(data: dict) -> Path:
-    image, draw = base_card("6月21日 4场胜负概率", "世界杯 2026 赛前方案", "01")
+def date_label(date_slug: str) -> str:
+    parts = date_slug.split("-")
+    if len(parts) >= 3:
+        return f"{int(parts[1])}月{int(parts[2])}日"
+    return date_slug
+
+
+def card_wdl(data: dict, date_slug: str, title_date: str) -> Path:
+    image, draw = base_card(f"{title_date} 4场胜负概率", "世界杯 2026 赛前方案", "01")
     y = 232
     for index, match in enumerate(data["matches"], start=1):
         box = (170, y, 1020, y + 238)
@@ -204,7 +212,7 @@ def card_wdl(data: dict) -> Path:
             draw_text(draw, (x, y + 171), pct(value), FONTS["small"], item_color)
         y += 274
     draw_text(draw, (170, 1348), "解读：胜平负概率为赛前模型口径，不代表确定结果。", FONTS["small"], COLORS["muted"])
-    out = OUT_DIR / "2026-06-21-01-win-loss.png"
+    out = OUT_DIR / f"{date_slug}-01-win-loss.png"
     image.save(out, quality=95)
     return out
 
@@ -258,7 +266,7 @@ def score_explanation(match: dict) -> str:
     return f"说明：在{favorite_label}倾向内选择最高概率比分。"
 
 
-def card_scores(data: dict) -> Path:
+def card_scores(data: dict, date_slug: str) -> Path:
     image, draw = base_card("AI比分预估", "世界杯 2026 比分预测", "02")
     panels = [
         (170, 228, 1020, 462),
@@ -281,29 +289,33 @@ def card_scores(data: dict) -> Path:
         for line_index, line in enumerate(wrap_text(draw, score_explanation(match), x2 - x1 - 390, FONTS["tiny"], 2)):
             draw_text(draw, (x1 + 330, y1 + 176 + line_index * 26), line, FONTS["tiny"], COLORS["muted"])
     draw_text(draw, (170, 1360), "说明：AI 模型计算结果，不构成建议。", FONTS["small"], COLORS["muted"])
-    out = OUT_DIR / "2026-06-21-02-score-pick.png"
+    out = OUT_DIR / f"{date_slug}-02-score-pick.png"
     image.save(out, quality=95)
-    legacy_out = OUT_DIR / "2026-06-21-02-score-top8.png"
+    legacy_out = OUT_DIR / f"{date_slug}-02-score-top8.png"
     image.save(legacy_out, quality=95)
     return out
 
 
-MATCH_SHORT = {
+DEFAULT_MATCH_SHORT = {
     "荷兰 vs 瑞典": "荷瑞",
     "德国 vs 科特迪瓦": "德科",
     "厄瓜多尔 vs 库拉索": "厄库",
     "突尼斯 vs 日本": "突日",
+    "新西兰 vs 埃及": "新埃",
+    "乌拉圭 vs 佛得角": "乌佛",
+    "比利时 vs 伊朗": "比伊",
+    "西班牙 vs 沙特": "西沙",
 }
 
 
-def short_parlay(parlay: dict) -> str:
+def short_parlay(parlay: dict, match_short: dict[str, str]) -> str:
     parts = []
     for leg in parlay["legs"]:
-        parts.append(f"{MATCH_SHORT.get(leg['match'], leg['match'])} {leg['score']}")
+        parts.append(f"{match_short.get(leg['match'], leg['match'])} {leg['score']}")
     return " / ".join(parts)
 
 
-def card_parlays(data: dict) -> Path:
+def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Path:
     image, draw = base_card("4 串 1 方案", "世界杯 2026 赛前方案", "03")
     groups = [
         ("前 3：稳健方向", "probability_first", COLORS["soft_green"], "更贴近胜负倾向"),
@@ -325,19 +337,20 @@ def card_parlays(data: dict) -> Path:
             row_fill = "#F7F1DE" if seq % 2 else COLORS["panel"]
             rounded(draw, (190, row_y - 9, 1000, row_y + 58), row_fill, radius=6)
             draw_text(draw, (198, row_y + 6), str(seq), FONTS["body"], COLORS["red"] if key == "expected_value_first" else COLORS["green"])
-            text = short_parlay(parlay)
+            text = short_parlay(parlay, match_short)
             draw_text(draw, (250, row_y + 5), text, fit_text(draw, text, 705, 25, 17), COLORS["ink"])
             row_y += 72
             seq += 1
         y += 368
-    draw_text(draw, (170, 1344), "缩写：荷瑞=荷兰vs瑞典，德科=德国vs科特迪瓦，厄库=厄瓜多尔vs库拉索，突日=突尼斯vs日本。", FONTS["tiny"], COLORS["muted"])
+    abbreviations = "，".join(f"{short}={match}" for match, short in match_short.items() if any(match == m["match"] for m in data["matches"]))
+    draw_text(draw, (170, 1344), f"缩写：{abbreviations}。", fit_text(draw, f"缩写：{abbreviations}。", 850, 17, 13), COLORS["muted"])
     draw_text(draw, (170, 1375), "说明：精确比分4串1属于高难度方案，仅作赛前模型结论展示。", FONTS["tiny"], COLORS["red"])
-    out = OUT_DIR / "2026-06-21-03-parlay-top9.png"
+    out = OUT_DIR / f"{date_slug}-03-parlay-top9.png"
     image.save(out, quality=95)
     return out
 
 
-def write_copy(data: dict, paths: list[Path]) -> Path:
+def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, match_short: dict[str, str]) -> Path:
     matches = []
     for match in data["matches"]:
         group, _prob = max(match["blended_wdl"].items(), key=lambda item: item[1])
@@ -358,12 +371,12 @@ def write_copy(data: dict, paths: list[Path]) -> Path:
     ]:
         parlay_lines.append(f"{title}：")
         for parlay in data["parlay_groups"][key]:
-            parlay_lines.append(f"- {short_parlay(parlay)}")
+            parlay_lines.append(f"- {short_parlay(parlay, match_short)}")
 
-    body = f"""# 小红书图文文案｜2026-06-21 世界杯预测
+    body = f"""# 小红书图文文案｜{date_slug} 世界杯预测
 
 ## 笔记标题
-世界杯 6/21 四场赛前结论：胜负、比分、4串1方案
+世界杯 {title_date} 四场赛前结论：胜负、比分、4串1方案
 
 ## 正文
 以下只展示赛前模型结论和方案，不展开计算指标。不是投注建议。
@@ -383,16 +396,28 @@ def write_copy(data: dict, paths: list[Path]) -> Path:
 ## 图片文件
 {chr(10).join(f'- {path.name}' for path in paths)}
 """
-    out = OUT_DIR / "2026-06-21-xhs-copy.md"
+    out = OUT_DIR / f"{date_slug}-xhs-copy.md"
     out.write_text(body, encoding="utf-8")
     return out
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--report-json", default=str(DEFAULT_REPORT_JSON), help="Analysis JSON produced by analyze_score_odds_parlay.py.")
+    parser.add_argument("--date", default="2026-06-21", help="Date slug for output filenames.")
+    parser.add_argument("--title-date", help="Human title date, e.g. 6月22日.")
+    args = parser.parse_args()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    data = json.loads(REPORT_JSON.read_text(encoding="utf-8"))
-    paths = [card_wdl(data), card_scores(data), card_parlays(data)]
-    copy_path = write_copy(data, paths)
+    data = json.loads(Path(args.report_json).read_text(encoding="utf-8"))
+    title_date = args.title_date or date_label(args.date)
+    match_short = DEFAULT_MATCH_SHORT.copy()
+    paths = [
+        card_wdl(data, args.date, title_date),
+        card_scores(data, args.date),
+        card_parlays(data, args.date, match_short),
+    ]
+    copy_path = write_copy(data, paths, args.date, title_date, match_short)
     print(json.dumps({"images": [str(path) for path in paths], "copy": str(copy_path)}, ensure_ascii=False, indent=2))
 
 
