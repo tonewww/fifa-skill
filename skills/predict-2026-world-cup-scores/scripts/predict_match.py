@@ -652,6 +652,14 @@ def matchup_style_delta(attacker_style: dict, defender_style: dict) -> tuple[flo
         delta += 0.03
         notes.append("wide attacks can create volume, but finishing quality still matters")
 
+    central_edge = style_value(attacker_style, "central_progression") - style_value(defender_style, "defensive_compactness")
+    if central_edge > 20:
+        delta += 0.04
+        notes.append("central progression can exploit lack of compactness")
+    elif central_edge < -20:
+        delta -= 0.03
+        notes.append("central attacks will be stifled by compact defense")
+
     return clamp(delta, -0.25, 0.25), notes[:4]
 
 
@@ -899,6 +907,15 @@ def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float],
             multiplier *= 1.0 + favorite_tilt * min(margin, 3) / 3.0
         if group == "draw" and draw_probability >= 0.30:
             multiplier *= 1.0 + draw_tilt / (1.0 + abs(total_goals - 2))
+            
+        # Adjust for Poisson's low-score bias (Dixon-Coles inspired heuristic)
+        if total_goals == 0:
+            multiplier *= 0.85  # Reduce 0-0 probability
+        elif total_goals >= 3:
+            multiplier *= 1.15  # Boost matches with 3+ goals
+        elif group == "draw" and total_goals == 2:
+            multiplier *= 1.10  # Boost 1-1 draw slightly to reflect realistic distribution
+            
         calibrated.append({**row, "probability": float(row["probability"]) * multiplier})
     return normalize_scores(calibrated)
 
@@ -1312,17 +1329,36 @@ def pct(value: float) -> str:
 
 
 def recommended_score(result: dict) -> str:
-    top = result["top_scorelines"][0]["score"]
-    goals_a, goals_b = [int(part) for part in top.split("-")]
+    top_score = result["top_scorelines"][0]["score"]
+    goals_a, goals_b = [int(part) for part in top_score.split("-")]
+    top_group = "team_a_win" if goals_a > goals_b else "team_b_win" if goals_b > goals_a else "draw"
+    
     probs = result["probabilities"]
-    if probs["team_a_win"] > probs["draw"] and probs["team_a_win"] > probs["team_b_win"] and goals_a <= goals_b:
-        goals_a = goals_b + 1
-    elif probs["team_b_win"] > probs["draw"] and probs["team_b_win"] > probs["team_a_win"] and goals_b <= goals_a:
-        goals_b = goals_a + 1
-    elif probs["draw"] >= probs["team_a_win"] and probs["draw"] >= probs["team_b_win"] and goals_a != goals_b:
-        m = min(goals_a, goals_b)
-        goals_a = goals_b = m
-    return f"{goals_a}-{goals_b}"
+    best_group = max(probs, key=probs.get)
+    best_prob = probs[best_group]
+    score_group_prob = probs[top_group]
+    
+    # In football, Win/Loss total probabilities are sums of many scorelines, so a Draw (e.g. 1-1) 
+    # can realistically be the single most likely exact scoreline even if one team has a 45% win prob.
+    # We only override the mathematical top score if it heavily contradicts the WDL breakdown.
+    if best_prob - score_group_prob > 0.12 and top_group != best_group:
+        # Find the highest probability score that matches the dominant outcome group
+        for item in result["top_scorelines"]:
+            ga, gb = [int(part) for part in item["score"].split("-")]
+            item_group = "team_a_win" if ga > gb else "team_b_win" if gb > ga else "draw"
+            if item_group == best_group:
+                return item["score"]
+                
+        # Fallback if no matching score is in the top_scorelines (rare)
+        if best_group == "team_a_win" and goals_a <= goals_b:
+            return f"{goals_b + 1}-{goals_b}"
+        elif best_group == "team_b_win" and goals_b <= goals_a:
+            return f"{goals_a}-{goals_a + 1}"
+        elif best_group == "draw" and goals_a != goals_b:
+            m = min(goals_a, goals_b)
+            return f"{m}-{m}"
+            
+    return top_score
 
 
 def confidence_label(result: dict) -> str:

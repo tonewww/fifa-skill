@@ -271,7 +271,8 @@ def recommendation_analysis_note(
     if recommended_group != favorite_group:
         return (
             f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
-            "但缺少该方向可用比分，退回全表概率最高比分。"
+            f"但概率最高的确切比分落在{outcome_label(recommended_group)}方向，"
+            f"两者概率差未达到显著偏离，尊重数学模型保留{outcome_label(recommended_group)}比分首选。"
         )
     if raw_top_score and raw_top_group and raw_top_group != favorite_group:
         return (
@@ -294,13 +295,20 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
     favorite_group, favorite_probability = match_favorite_group(match)
     ranked = sorted(match["candidates"], key=lambda row: row["blended_probability"], reverse=True)
     raw_top = ranked[0] if ranked else {}
+    raw_top_group = raw_top.get("group")
+    top_score_group_prob = float(match.get("blended_wdl", {}).get(raw_top_group, 0.0))
+    
+    target_group = favorite_group
+    if favorite_probability - top_score_group_prob <= 0.12 or raw_top_group == favorite_group:
+        target_group = raw_top_group
+
     aligned = [
         candidate
         for candidate in ranked
-        if candidate["group"] == favorite_group and "其它" not in candidate["score"]
+        if candidate["group"] == target_group and "其它" not in candidate["score"]
     ]
     raw_recommendation = aligned[0] if aligned else raw_top
-    recommendation, shape_context = score_shape_adjusted_recommendation(aligned, raw_recommendation, match, favorite_group)
+    recommendation, shape_context = score_shape_adjusted_recommendation(aligned, raw_recommendation, match, target_group)
     target_total = float(shape_context["target_total"]) if shape_context else openness_target_total(match)
     openness_adjusted = bool(shape_context and shape_context.get("kind") == "open")
     score_shape_adjusted = recommendation.get("score") != raw_recommendation.get("score")
@@ -368,14 +376,25 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
     result = predict(db_path, home_id, away_id, "Group Stage", True, False)
     dist = score_distribution(result)
     flat, market_wdl = flatten_odds(item["odds"])
-    model_weight = 1.0 - market_weight
+    
+    # Meta-Learner: Adjust market weight based on data readiness
+    readiness_a = result.get("data_readiness", {}).get(home_id, {})
+    readiness_b = result.get("data_readiness", {}).get(away_id, {})
+    penalty = 0.0
+    if not readiness_a.get("lineup") or not readiness_b.get("lineup"):
+        penalty += 0.15
+    if not readiness_a.get("tactical_plan") or not readiness_b.get("tactical_plan"):
+        penalty += 0.10
+    dynamic_market_weight = min(0.85, market_weight + penalty)
+    model_weight = 1.0 - dynamic_market_weight
+    
     model_wdl = {
         "home_win": result["probabilities"]["team_a_win"],
         "draw": result["probabilities"]["draw"],
         "away_win": result["probabilities"]["team_b_win"],
     }
     blend_wdl = {
-        group: model_weight * model_wdl[group] + market_weight * market_wdl[group]
+        group: model_weight * model_wdl[group] + dynamic_market_weight * market_wdl[group]
         for group in ("home_win", "draw", "away_win")
     }
     model_group_probability = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
@@ -398,7 +417,7 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
             )
         else:
             model_probability = dist.get(row["score"], 0.0)
-        blended_probability = model_weight * model_probability + market_weight * row["market_probability"]
+        blended_probability = model_weight * model_probability + dynamic_market_weight * row["market_probability"]
         candidate = {
             "match": f"{home_name} vs {away_name}",
             "home_team": home_name,
@@ -423,6 +442,7 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         "market_wdl": market_wdl,
         "blended_wdl": blend_wdl,
         "candidates": candidates,
+        "market_weight": dynamic_market_weight,
     }
     match["recommended_score"] = recommended_score_candidates(match)
     return match
