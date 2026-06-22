@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from common import average, clamp, connect, today_utc, weighted_average
+from common import average, clamp, connect, dedupe_team_result_rows, today_utc, weighted_average
 
 
 SOURCE_ID = "derived_team_features"
@@ -112,9 +112,10 @@ def recent_result_features(conn, team_id: str, limit: int) -> dict:
         ORDER BY match_date DESC
         LIMIT ?
         """,
-        (team_id, limit),
+        (team_id, limit * 2),
     ).fetchall()
-    rows = [dict(row) for row in rows]
+    rows, _duplicates = dedupe_team_result_rows([dict(row) for row in rows])
+    rows = sorted(rows, key=lambda row: (row.get("match_date") or "", row.get("result_id") or ""), reverse=True)[:limit]
     if not rows:
         return {
             "sample": 0,

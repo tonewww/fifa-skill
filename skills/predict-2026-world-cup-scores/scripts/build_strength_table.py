@@ -7,7 +7,7 @@ import argparse
 import math
 from pathlib import Path
 
-from common import MODEL_VERSION, average, clamp, connect, table_exists, today_utc, weighted_average
+from common import MODEL_VERSION, average, clamp, connect, dedupe_team_result_rows, table_exists, today_utc, weighted_average
 
 
 DEFAULTS = {
@@ -341,14 +341,16 @@ def player_components(conn, team_id: str) -> dict[str, float]:
 def form_component(conn, team_id: str) -> float:
     rows = conn.execute(
         """
-        SELECT goals_for, goals_against, xg_for, xg_against, elo_before, elo_after
+        SELECT result_id, match_date, team_id, opponent_team_id, goals_for, goals_against, xg_for, xg_against, elo_before, elo_after, source_id
         FROM team_results
         WHERE team_id = ?
         ORDER BY match_date DESC
-        LIMIT 12
+        LIMIT 24
         """,
         (team_id,),
     ).fetchall()
+    rows, _duplicates = dedupe_team_result_rows([dict(row) for row in rows])
+    rows = sorted(rows, key=lambda row: (row.get("match_date") or "", row.get("result_id") or ""), reverse=True)[:12]
     if not rows:
         return DEFAULTS["form_rating"]
 

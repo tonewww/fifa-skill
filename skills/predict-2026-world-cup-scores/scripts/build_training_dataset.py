@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from common import connect, now_utc, slugify, table_exists
+from common import connect, dedupe_match_rows, now_utc, slugify, table_exists
 
 
 SOURCE_ID = "local_training_dataset"
@@ -197,7 +197,7 @@ def upsert_training_match(conn, row: dict) -> None:
     )
 
 
-def build_from_fixtures(conn, since: str | None, until: str | None, world_cup_weight: float, imported_at: str) -> int:
+def build_from_fixtures(conn, since: str | None, until: str | None, world_cup_weight: float, imported_at: str) -> tuple[int, int]:
     filters = [
         "team_a_id IS NOT NULL",
         "team_b_id IS NOT NULL",
@@ -223,9 +223,16 @@ def build_from_fixtures(conn, since: str | None, until: str | None, world_cup_we
         """,
         params,
     ).fetchall()
+    rows, duplicates = dedupe_match_rows(
+        [dict(row) for row in rows],
+        team_a_key="team_a_id",
+        team_b_key="team_b_id",
+        score_a_key="score_a",
+        score_b_key="score_b",
+    )
     count = 0
     for raw in rows:
-        row = dict(raw)
+        row = raw
         family = competition_family(row.get("competition"), row.get("stage"))
         weight, reason = sample_weight(
             "international",
@@ -262,7 +269,7 @@ def build_from_fixtures(conn, since: str | None, until: str | None, world_cup_we
             },
         )
         count += 1
-    return count
+    return count, duplicates
 
 
 def build_from_club_matches(conn, since: str | None, until: str | None, club_weight: float, imported_at: str) -> int:
@@ -374,7 +381,7 @@ def build_training_dataset(
         ensure_schema(conn)
         if replace:
             conn.execute("DELETE FROM training_matches")
-        international = build_from_fixtures(conn, since, until, world_cup_weight, imported_at)
+        international, duplicate_fixtures_skipped = build_from_fixtures(conn, since, until, world_cup_weight, imported_at)
         club = build_from_club_matches(conn, since, until, club_weight, imported_at) if include_club else 0
         conn.commit()
         summary = conn.execute(
@@ -401,6 +408,7 @@ def build_training_dataset(
             "training_matches": int(summary["rows"] or 0),
             "total_weight": round(float(summary["total_weight"] or 0.0), 3),
             "international_upserted": international,
+            "duplicate_fixtures_skipped": duplicate_fixtures_skipped,
             "club_upserted": club,
             "world_cup_rows": int(summary["world_cup_rows"] or 0),
             "club_rows": int(summary["club_rows"] or 0),

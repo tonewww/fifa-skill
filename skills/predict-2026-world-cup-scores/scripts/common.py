@@ -934,6 +934,101 @@ def weighted_average(values: list[tuple[float | None, float | None]], default: f
     return total / weight
 
 
+def source_priority(source_id: str | None) -> int:
+    text = (source_id or "").lower()
+    if text in {"fifa_official", "fifa_match_centre", "fifa_match_report"}:
+        return 0
+    if text == "martj42_international_results":
+        return 1
+    if text == "user_reported_result":
+        return 2
+    return 3
+
+
+def iso_date_ordinal(value: str | None) -> int | None:
+    try:
+        return dt.date.fromisoformat(str(value or "")).toordinal()
+    except ValueError:
+        return None
+
+
+def dedupe_match_rows(
+    rows: list[dict],
+    *,
+    team_a_key: str,
+    team_b_key: str,
+    score_a_key: str,
+    score_b_key: str,
+    date_key: str = "match_date",
+    source_key: str = "source_id",
+    id_key: str = "match_id",
+    one_day_window: bool = True,
+) -> tuple[list[dict], int]:
+    """Keep one row for likely duplicate matches while preserving source rows."""
+    best_by_signature: dict[tuple, dict] = {}
+    duplicates = 0
+    for row in rows:
+        team_a = row.get(team_a_key)
+        team_b = row.get(team_b_key)
+        if team_a is None or team_b is None:
+            key = (row.get(date_key), row.get(id_key))
+            if key in best_by_signature:
+                duplicates += 1
+            best_by_signature[key] = row
+            continue
+
+        teams = tuple(sorted([team_a, team_b]))
+        if str(team_a) <= str(team_b):
+            score_pair = (row.get(score_a_key), row.get(score_b_key))
+        else:
+            score_pair = (row.get(score_b_key), row.get(score_a_key))
+
+        ordinal = iso_date_ordinal(row.get(date_key))
+        if ordinal is None:
+            candidate_keys = [(teams, score_pair, row.get(date_key))]
+        elif one_day_window:
+            candidate_keys = [(teams, score_pair, day) for day in (ordinal - 1, ordinal, ordinal + 1)]
+        else:
+            candidate_keys = [(teams, score_pair, ordinal)]
+
+        existing_key = next((key for key in candidate_keys if key in best_by_signature), None)
+        if existing_key is None:
+            key = candidate_keys[1] if ordinal is not None and one_day_window else candidate_keys[0]
+            best_by_signature[key] = row
+            continue
+
+        duplicates += 1
+        current = best_by_signature[existing_key]
+        incoming_rank = (
+            source_priority(row.get(source_key)),
+            row.get(date_key) or "",
+            row.get(id_key) or "",
+        )
+        current_rank = (
+            source_priority(current.get(source_key)),
+            current.get(date_key) or "",
+            current.get(id_key) or "",
+        )
+        if incoming_rank < current_rank:
+            best_by_signature[existing_key] = row
+
+    return (
+        sorted(best_by_signature.values(), key=lambda item: ((item.get(date_key) or ""), item.get(id_key) or "")),
+        duplicates,
+    )
+
+
+def dedupe_team_result_rows(rows: list[dict]) -> tuple[list[dict], int]:
+    return dedupe_match_rows(
+        rows,
+        team_a_key="team_id",
+        team_b_key="opponent_team_id",
+        score_a_key="goals_for",
+        score_b_key="goals_against",
+        id_key="result_id",
+    )
+
+
 def find_team_id(conn: sqlite3.Connection, query: str) -> str | None:
     key = query.strip()
     row = conn.execute(

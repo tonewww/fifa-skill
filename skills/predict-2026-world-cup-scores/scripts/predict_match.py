@@ -8,7 +8,7 @@ import json
 import math
 from pathlib import Path
 
-from common import MODEL_VERSION, clamp, connect, find_team_id, now_utc, table_exists, today_utc
+from common import MODEL_VERSION, clamp, connect, dedupe_team_result_rows, find_team_id, now_utc, table_exists, today_utc
 
 
 DEFAULT_PARAMETERS = {
@@ -374,7 +374,7 @@ def tactical_risk(plan: dict) -> float:
 def recent_goal_profile(conn, team_id: str, limit: int = 8) -> dict:
     rows = conn.execute(
         """
-        SELECT goals_for, goals_against, competition
+        SELECT result_id, match_date, team_id, opponent_team_id, goals_for, goals_against, competition, source_id
         FROM team_results
         WHERE team_id = ?
           AND goals_for IS NOT NULL
@@ -382,8 +382,10 @@ def recent_goal_profile(conn, team_id: str, limit: int = 8) -> dict:
         ORDER BY date(match_date) DESC
         LIMIT ?
         """,
-        (team_id, limit),
+        (team_id, limit * 2),
     ).fetchall()
+    rows, _duplicates = dedupe_team_result_rows([dict(row) for row in rows])
+    rows = sorted(rows, key=lambda row: (row.get("match_date") or "", row.get("result_id") or ""), reverse=True)[:limit]
     if not rows:
         return {
             "sample": 0,
