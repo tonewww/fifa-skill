@@ -22,6 +22,22 @@ DEFAULT_TEAM_MAP = {
     "库拉索": "CUW",
     "突尼斯": "TUN",
     "日本": "JPN",
+    "阿根廷": "ARG",
+    "奥地利": "AUT",
+    "法国": "FRA",
+    "伊拉克": "IRQ",
+    "挪威": "NOR",
+    "塞内加尔": "SEN",
+    "约旦": "JOR",
+    "阿尔及利亚": "ALG",
+    "葡萄牙": "POR",
+    "乌兹别克": "UZB",
+    "英格兰": "ENG",
+    "加纳": "GHA",
+    "巴拿马": "PAN",
+    "克罗地亚": "CRO",
+    "哥伦比亚": "COL",
+    "刚果金": "COD",
 }
 
 
@@ -377,7 +393,8 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
     dist = score_distribution(result)
     flat, market_wdl = flatten_odds(item["odds"])
     
-    # Meta-Learner: Adjust market weight based on data readiness
+    # Keep the requested model/market blend stable by default. Data-readiness
+    # penalties are exposed as a diagnostic instead of silently changing 70/30.
     readiness_a = result.get("data_readiness", {}).get(home_id, {})
     readiness_b = result.get("data_readiness", {}).get(away_id, {})
     penalty = 0.0
@@ -385,7 +402,7 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         penalty += 0.15
     if not readiness_a.get("tactical_plan") or not readiness_b.get("tactical_plan"):
         penalty += 0.10
-    dynamic_market_weight = min(0.85, market_weight + penalty)
+    dynamic_market_weight = market_weight
     model_weight = 1.0 - dynamic_market_weight
     
     model_wdl = {
@@ -443,6 +460,8 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         "blended_wdl": blend_wdl,
         "candidates": candidates,
         "market_weight": dynamic_market_weight,
+        "data_readiness_market_penalty": penalty,
+        "data_readiness_market_weight_if_enabled": min(0.85, market_weight + penalty),
     }
     match["recommended_score"] = recommended_score_candidates(match)
     return match

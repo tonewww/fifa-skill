@@ -42,6 +42,10 @@ DEFAULT_PARAMETERS = {
     "wdl_score_calibration_weight": 0.70,
     "favorite_score_tilt": 0.10,
     "draw_score_tilt": 0.08,
+    "high_total_score_boost": 0.14,
+    "very_high_total_score_boost": 0.10,
+    "nil_nil_dampener": 0.15,
+    "one_goal_win_dampener": 0.04,
 }
 
 
@@ -128,6 +132,10 @@ def ensure_model_parameter_columns(conn) -> None:
         "wdl_score_calibration_weight": "REAL",
         "favorite_score_tilt": "REAL",
         "draw_score_tilt": "REAL",
+        "high_total_score_boost": "REAL",
+        "very_high_total_score_boost": "REAL",
+        "nil_nil_dampener": "REAL",
+        "one_goal_win_dampener": "REAL",
     }
     changed = False
     for name, ddl_type in additions.items():
@@ -896,6 +904,10 @@ def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float],
     draw_probability = float(target_wdl["draw"])
     favorite_tilt = float(params.get("favorite_score_tilt", 0.0) or 0.0)
     draw_tilt = float(params.get("draw_score_tilt", 0.0) or 0.0)
+    high_total_boost = clamp(float(params.get("high_total_score_boost", 0.14) or 0.0), 0.0, 0.35)
+    very_high_total_boost = clamp(float(params.get("very_high_total_score_boost", 0.10) or 0.0), 0.0, 0.30)
+    nil_nil_dampener = clamp(float(params.get("nil_nil_dampener", 0.15) or 0.0), 0.0, 0.40)
+    one_goal_win_dampener = clamp(float(params.get("one_goal_win_dampener", 0.04) or 0.0), 0.0, 0.20)
     calibrated = []
     for row in rows:
         group = row["group"]
@@ -910,13 +922,24 @@ def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float],
         if group == "draw" and draw_probability >= 0.30:
             multiplier *= 1.0 + draw_tilt / (1.0 + abs(total_goals - 2))
             
-        # Adjust for Poisson's low-score bias (Dixon-Coles inspired heuristic)
+        # Adjust independent Poisson's tendency to concentrate too much mass
+        # around low totals when the tournament sample is showing fatter tails.
         if total_goals == 0:
-            multiplier *= 0.85  # Reduce 0-0 probability
+            multiplier *= 1.0 - nil_nil_dampener
+        elif margin == 1 and total_goals <= 2 and group != "draw":
+            multiplier *= 1.0 - one_goal_win_dampener
         elif total_goals >= 3:
-            multiplier *= 1.15  # Boost matches with 3+ goals
+            multiplier *= 1.0 + high_total_boost
+        if total_goals >= 4:
+            multiplier *= 1.0 + very_high_total_boost
+        if total_goals >= 5:
+            multiplier *= 1.0 + 0.5 * very_high_total_boost
+        if total_goals >= 3 and margin >= 2 and group == favorite_group:
+            multiplier *= 1.0 + 0.5 * favorite_tilt
+        if total_goals >= 3 and group != favorite_group and favorite_probability < 0.56:
+            multiplier *= 1.0 + 0.35 * high_total_boost
         elif group == "draw" and total_goals == 2:
-            multiplier *= 1.10  # Boost 1-1 draw slightly to reflect realistic distribution
+            multiplier *= 1.0 + draw_tilt
             
         calibrated.append({**row, "probability": float(row["probability"]) * multiplier})
     return normalize_scores(calibrated)
