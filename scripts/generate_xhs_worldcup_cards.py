@@ -146,14 +146,14 @@ def pill(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, fill: str, fg: st
     return x + tw + pad_x * 2
 
 
-def base_card(title: str, kicker: str, issue: str) -> tuple[Image.Image, ImageDraw.ImageDraw]:
-    image = Image.new("RGB", (WIDTH, HEIGHT), COLORS["paper"])
+def base_card(title: str, kicker: str, issue: str, height: int = 1440) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+    image = Image.new("RGB", (WIDTH, height), COLORS["paper"])
     draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill=COLORS["green"])
-    draw.rectangle((0, 0, 128, HEIGHT), fill=COLORS["red"])
-    draw.rectangle((128, 0, WIDTH, HEIGHT), fill=COLORS["paper"])
+    draw.rectangle((0, 0, WIDTH, height), fill=COLORS["green"])
+    draw.rectangle((0, 0, 128, height), fill=COLORS["red"])
+    draw.rectangle((128, 0, WIDTH, height), fill=COLORS["paper"])
 
-    for i in range(0, HEIGHT, 70):
+    for i in range(0, height, 70):
         draw.line((128, i, WIDTH, i - 220), fill="#E5DECD", width=1)
     draw.rectangle((128, 0, WIDTH, 188), fill=COLORS["green"])
     draw.rectangle((128, 169, WIDTH, 188), fill=COLORS["red"])
@@ -181,7 +181,9 @@ def date_label(date_slug: str) -> str:
 
 
 def card_wdl(data: dict, date_slug: str, title_date: str) -> Path:
-    image, draw = base_card(f"{title_date} 4场胜负概率", "世界杯 2026 赛前方案", "01")
+    num_matches = len(data["matches"])
+    height = max(1440, 232 + num_matches * 274 + 100)
+    image, draw = base_card(f"{title_date} {num_matches}场胜负概率", "世界杯 2026 赛前方案", "01", height=height)
     y = 232
     for index, match in enumerate(data["matches"], start=1):
         box = (170, y, 1020, y + 238)
@@ -211,7 +213,7 @@ def card_wdl(data: dict, date_slug: str, title_date: str) -> Path:
             draw_text(draw, (x, y + 145), name, FONTS["tiny"], COLORS["muted"])
             draw_text(draw, (x, y + 171), pct(value), FONTS["small"], item_color)
         y += 274
-    draw_text(draw, (170, 1348), "解读：胜平负概率为赛前模型口径，不代表确定结果。", FONTS["small"], COLORS["muted"])
+    draw_text(draw, (170, height - 92), "解读：胜平负概率为赛前模型口径，不代表确定结果。", FONTS["small"], COLORS["muted"])
     out = OUT_DIR / f"{date_slug}-01-win-loss.png"
     image.save(out, quality=95)
     return out
@@ -267,13 +269,16 @@ def score_explanation(match: dict) -> str:
 
 
 def card_scores(data: dict, date_slug: str) -> Path:
-    image, draw = base_card("AI比分预估", "世界杯 2026 比分预测", "02")
-    panels = [
-        (170, 228, 1020, 462),
-        (170, 508, 1020, 742),
-        (170, 788, 1020, 1022),
-        (170, 1068, 1020, 1302),
-    ]
+    num_matches = len(data["matches"])
+    height = max(1440, 228 + num_matches * 280 + 100)
+    image, draw = base_card("AI比分预估", "世界杯 2026 比分预测", "02", height=height)
+    
+    y_start = 228
+    panels = []
+    for _ in range(num_matches):
+        panels.append((170, y_start, 1020, y_start + 234))
+        y_start += 280
+        
     for match, box in zip(data["matches"], panels):
         x1, y1, x2, y2 = box
         rounded(draw, box, COLORS["panel"], COLORS["line"], radius=8)
@@ -288,7 +293,7 @@ def card_scores(data: dict, date_slug: str) -> Path:
         draw_text(draw, (x1 + 330, y1 + 143), f"概率 {pct(recommended_probability(match))}", FONTS["small"], COLORS["green"])
         for line_index, line in enumerate(wrap_text(draw, score_explanation(match), x2 - x1 - 390, FONTS["tiny"], 2)):
             draw_text(draw, (x1 + 330, y1 + 176 + line_index * 26), line, FONTS["tiny"], COLORS["muted"])
-    draw_text(draw, (170, 1360), "说明：AI 模型计算结果，不构成建议。", FONTS["small"], COLORS["muted"])
+    draw_text(draw, (170, height - 80), "说明：AI 模型计算结果，不构成建议。", FONTS["small"], COLORS["muted"])
     out = OUT_DIR / f"{date_slug}-02-score-pick.png"
     image.save(out, quality=95)
     legacy_out = OUT_DIR / f"{date_slug}-02-score-top8.png"
@@ -305,18 +310,35 @@ DEFAULT_MATCH_SHORT = {
     "乌拉圭 vs 佛得角": "乌佛",
     "比利时 vs 伊朗": "比伊",
     "西班牙 vs 沙特": "西沙",
+    "阿根廷 vs 奥地利": "阿奥",
+    "法国 vs 伊拉克": "法伊",
+    "挪威 vs 塞内加尔": "挪塞",
+    "约旦 vs 阿尔及利亚": "约阿",
+    "葡萄牙 vs 乌兹别克": "葡乌",
+    "英格兰 vs 加纳": "英加",
+    "巴拿马 vs 克罗地亚": "巴克",
+    "哥伦比亚 vs 刚果金": "哥刚",
 }
 
+
+def auto_short_match(match_name: str) -> str:
+    parts = match_name.split(" vs ")
+    if len(parts) == 2:
+        return parts[0][0] + parts[1][0]
+    return match_name
 
 def short_parlay(parlay: dict, match_short: dict[str, str]) -> str:
     parts = []
     for leg in parlay["legs"]:
-        parts.append(f"{match_short.get(leg['match'], leg['match'])} {leg['score']}")
+        m_name = leg['match']
+        short_name = match_short.get(m_name) or auto_short_match(m_name)
+        parts.append(f"{short_name} {leg['score']}")
     return " / ".join(parts)
 
 
 def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Path:
-    image, draw = base_card("4 串 1 方案", "世界杯 2026 赛前方案", "03")
+    # We might need a larger height if there are many legs making the text wrap more
+    image, draw = base_card("6 串 1 方案" if len(data["matches"]) == 6 else "4 串 1 方案", "世界杯 2026 赛前方案", "03", height=1440)
     groups = [
         ("前 3：稳健方向", "probability_first", COLORS["soft_green"], "更贴近胜负倾向"),
         ("中 3：进取方向", "odds_first", COLORS["soft_amber"], "保留一处冷门思路"),
@@ -342,9 +364,16 @@ def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Pat
             row_y += 72
             seq += 1
         y += 368
-    abbreviations = "，".join(f"{short}={match}" for match, short in match_short.items() if any(match == m["match"] for m in data["matches"]))
+    
+    abb_list = []
+    for m in data["matches"]:
+        m_name = m["match"]
+        s_name = match_short.get(m_name) or auto_short_match(m_name)
+        abb_list.append(f"{s_name}={m_name}")
+    abbreviations = "，".join(abb_list)
+    
     draw_text(draw, (170, 1344), f"缩写：{abbreviations}。", fit_text(draw, f"缩写：{abbreviations}。", 850, 17, 13), COLORS["muted"])
-    draw_text(draw, (170, 1375), "说明：精确比分4串1属于高难度方案，仅作赛前模型结论展示。", FONTS["tiny"], COLORS["red"])
+    draw_text(draw, (170, 1375), "说明：精确比分长串属于高难度方案，仅作赛前模型结论展示。", FONTS["tiny"], COLORS["red"])
     out = OUT_DIR / f"{date_slug}-03-parlay-top9.png"
     image.save(out, quality=95)
     return out

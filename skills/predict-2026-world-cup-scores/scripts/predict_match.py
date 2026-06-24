@@ -12,17 +12,17 @@ from common import MODEL_VERSION, clamp, connect, dedupe_team_result_rows, find_
 
 
 DEFAULT_PARAMETERS = {
-    "base_goals": 1.22,
+    "base_goals": 1.30,
     "home_edge": 0.12,
     "knockout_drag": -0.07,
-    "attack_weight": 0.85,
+    "attack_weight": 0.95,
     "overall_weight": 0.55,
     "keeper_weight": 0.25,
     "set_piece_weight": 0.18,
     "fitness_weight": 0.12,
     "style_weight": 1.0,
     "formation_weight": 0.25,
-    "openness_baseline_total": 2.55,
+    "openness_baseline_total": 2.65,
     "recent_goal_openness_weight": 0.28,
     "formation_openness_weight": 0.38,
     "style_openness_weight": 0.20,
@@ -40,12 +40,16 @@ DEFAULT_PARAMETERS = {
     "wdl_prior_weight": 0.65,
     "formation_wdl_prior_max_weight": 0.35,
     "wdl_score_calibration_weight": 0.70,
-    "favorite_score_tilt": 0.10,
-    "draw_score_tilt": 0.08,
-    "high_total_score_boost": 0.14,
-    "very_high_total_score_boost": 0.10,
-    "nil_nil_dampener": 0.15,
+    "favorite_score_tilt": 0.18,
+    "draw_score_tilt": -0.05,
+    "high_total_score_boost": 0.20,
+    "very_high_total_score_boost": 0.25,
+    "nil_nil_dampener": 0.10,
     "one_goal_win_dampener": 0.04,
+    "open_draw_score_boost": 0.10,
+    "btg_score_boost": 0.08,
+    "dixon_coles_rho": 0.0,
+    "zero_inflation": 0.12,
 }
 
 
@@ -136,6 +140,10 @@ def ensure_model_parameter_columns(conn) -> None:
         "very_high_total_score_boost": "REAL",
         "nil_nil_dampener": "REAL",
         "one_goal_win_dampener": "REAL",
+        "open_draw_score_boost": "REAL",
+        "btg_score_boost": "REAL",
+        "dixon_coles_rho": "REAL",
+        "zero_inflation": "REAL",
     }
     changed = False
     for name, ddl_type in additions.items():
@@ -673,7 +681,13 @@ def matchup_style_delta(attacker_style: dict, defender_style: dict) -> tuple[flo
     return clamp(delta, -0.25, 0.25), notes[:4]
 
 
-def poisson(k: int, lam: float) -> float:
+def poisson(k: int, lam: float, zero_inflation: float = 0.0) -> float:
+    if zero_inflation > 0:
+        base_lam = lam / max(0.01, 1.0 - zero_inflation)
+        p_poisson = math.exp(-base_lam) * (base_lam**k) / math.factorial(k)
+        if k == 0:
+            return zero_inflation + (1.0 - zero_inflation) * p_poisson
+        return (1.0 - zero_inflation) * p_poisson
     return math.exp(-lam) * (lam**k) / math.factorial(k)
 
 
@@ -859,12 +873,21 @@ def strength_wdl_prior(
     return softmax_three(feature_edge, draw_score, -feature_edge)
 
 
-def raw_score_grid(lambda_a: float, lambda_b: float, max_goals: int = 7) -> list[dict]:
+def raw_score_grid(lambda_a: float, lambda_b: float, max_goals: int = 7, dixon_coles_rho: float = 0.0, zero_inflation: float = 0.0) -> list[dict]:
     rows = []
     p_a = p_d = p_b = 0.0
     for goals_a in range(max_goals + 1):
         for goals_b in range(max_goals + 1):
-            prob = poisson(goals_a, lambda_a) * poisson(goals_b, lambda_b)
+            prob = poisson(goals_a, lambda_a, zero_inflation) * poisson(goals_b, lambda_b, zero_inflation)
+            if dixon_coles_rho != 0.0:
+                if goals_a == 0 and goals_b == 0:
+                    prob *= max(0.0, 1.0 - lambda_a * lambda_b * dixon_coles_rho)
+                elif goals_a == 0 and goals_b == 1:
+                    prob *= max(0.0, 1.0 + lambda_a * dixon_coles_rho)
+                elif goals_a == 1 and goals_b == 0:
+                    prob *= max(0.0, 1.0 + lambda_b * dixon_coles_rho)
+                elif goals_a == 1 and goals_b == 1:
+                    prob *= max(0.0, 1.0 - dixon_coles_rho)
             group = score_group_from_goals(goals_a, goals_b)
             if group == "team_a_win":
                 p_a += prob
@@ -908,6 +931,11 @@ def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float],
     very_high_total_boost = clamp(float(params.get("very_high_total_score_boost", 0.10) or 0.0), 0.0, 0.30)
     nil_nil_dampener = clamp(float(params.get("nil_nil_dampener", 0.15) or 0.0), 0.0, 0.40)
     one_goal_win_dampener = clamp(float(params.get("one_goal_win_dampener", 0.04) or 0.0), 0.0, 0.20)
+    open_draw_boost = clamp(float(params.get("open_draw_score_boost", 0.10) or 0.0), 0.0, 0.30)
+    btg_boost = clamp(float(params.get("btg_score_boost", 0.08) or 0.0), 0.0, 0.25)
+    sorted_wdl = sorted((float(value) for value in target_wdl.values()), reverse=True)
+    favorite_edge = sorted_wdl[0] - sorted_wdl[1] if len(sorted_wdl) >= 2 else 0.0
+    is_balanced_open = favorite_probability < 0.52 and favorite_edge < 0.18
     calibrated = []
     for row in rows:
         group = row["group"]
@@ -934,6 +962,12 @@ def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float],
             multiplier *= 1.0 + very_high_total_boost
         if total_goals >= 5:
             multiplier *= 1.0 + 0.5 * very_high_total_boost
+        if goals_a > 0 and goals_b > 0 and total_goals >= 3:
+            multiplier *= 1.0 + btg_boost
+        if is_balanced_open and group == "draw" and total_goals >= 2:
+            multiplier *= 1.0 + open_draw_boost
+            if total_goals >= 4:
+                multiplier *= 1.0 + 0.5 * open_draw_boost
         if total_goals >= 3 and margin >= 2 and group == favorite_group:
             multiplier *= 1.0 + 0.5 * favorite_tilt
         if total_goals >= 3 and group != favorite_group and favorite_probability < 0.56:
@@ -952,7 +986,9 @@ def score_distribution(
     params: dict | None = None,
     max_goals: int = 7,
 ) -> tuple[float, float, float, list[dict], dict]:
-    rows = raw_score_grid(lambda_a, lambda_b, max_goals)
+    rho = float(params.get("dixon_coles_rho", 0.0) or 0.0) if params else 0.0
+    zi = float(params.get("zero_inflation", 0.0) or 0.0) if params else 0.0
+    rows = raw_score_grid(lambda_a, lambda_b, max_goals, rho, zi)
     raw_wdl = aggregate_wdl(rows)
     if target_wdl and params:
         rows = calibrate_score_distribution(rows, target_wdl, params)
@@ -1104,7 +1140,10 @@ def predict(
         lambda_b *= stage_multiplier
         lambda_a = clamp(lambda_a, 0.2, 3.8)
         lambda_b = clamp(lambda_b, 0.2, 3.8)
-        base_rows = raw_score_grid(lambda_a, lambda_b)
+
+        rho = float(params.get("dixon_coles_rho", 0.0) or 0.0)
+        zi = float(params.get("zero_inflation", 0.0) or 0.0)
+        base_rows = raw_score_grid(lambda_a, lambda_b, dixon_coles_rho=rho, zero_inflation=zi)
         raw_wdl = aggregate_wdl(base_rows)
         prior_wdl = strength_wdl_prior(
             strength_a,

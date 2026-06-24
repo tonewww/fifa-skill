@@ -202,6 +202,33 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
     return None
 
 
+def score_group_for_recommendation(match: dict, favorite_group: str, raw_top_group: str | None) -> tuple[str, str | None]:
+    blended_wdl = match.get("blended_wdl") or {}
+    prediction = match.get("prediction") or {}
+    openness = prediction.get("openness") or {}
+    favorite_probability = float(blended_wdl.get(favorite_group) or 0.0)
+    raw_group_probability = float(blended_wdl.get(raw_top_group, 0.0) or 0.0)
+    draw_probability = float(blended_wdl.get("draw") or 0.0)
+    sorted_wdl = sorted((float(value) for value in blended_wdl.values()), reverse=True)
+    favorite_edge = sorted_wdl[0] - sorted_wdl[1] if len(sorted_wdl) >= 2 else 0.0
+    lambda_total = float(prediction.get("lambda_a") or 0.0) + float(prediction.get("lambda_b") or 0.0)
+    total_delta = float(openness.get("total_delta") or 0.0)
+
+    if raw_top_group == favorite_group:
+        return favorite_group, None
+    if favorite_probability - raw_group_probability <= 0.12:
+        return str(raw_top_group), "raw_group_close"
+    if (
+        raw_top_group == "draw"
+        and favorite_probability < 0.52
+        and favorite_edge < 0.18
+        and draw_probability >= 0.25
+        and (lambda_total >= 2.45 or total_delta >= 0.10)
+    ):
+        return "draw", "balanced_open_draw"
+    return favorite_group, None
+
+
 def score_shape_adjusted_recommendation(
     aligned: list[dict],
     raw_recommendation: dict,
@@ -255,6 +282,7 @@ def recommendation_analysis_note(
     openness_adjusted: bool = False,
     target_total: float | None = None,
     shape_context: dict | None = None,
+    selection_reason: str | None = None,
 ) -> str:
     favorite_label = outcome_label(favorite_group)
     recommended_group = recommendation.get("group")
@@ -285,6 +313,18 @@ def recommendation_analysis_note(
             f"因此在{favorite_label}方向内上调到更高总进球比分。"
         )
     if recommended_group != favorite_group:
+        if selection_reason == "balanced_open_draw":
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
+                "但双方强弱差距较小且比赛开放度偏高；"
+                f"因此允许{outcome_label(recommended_group)}方向的高概率比分作为首选。"
+            )
+        if selection_reason == "raw_group_close":
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
+                f"但{outcome_label(recommended_group)}方向与胜负倾向差距很小，"
+                "按混合概率最高比分输出。"
+            )
         return (
             f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
             f"但概率最高的确切比分落在{outcome_label(recommended_group)}方向，"
@@ -312,11 +352,7 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
     ranked = sorted(match["candidates"], key=lambda row: row["blended_probability"], reverse=True)
     raw_top = ranked[0] if ranked else {}
     raw_top_group = raw_top.get("group")
-    top_score_group_prob = float(match.get("blended_wdl", {}).get(raw_top_group, 0.0))
-    
-    target_group = favorite_group
-    if favorite_probability - top_score_group_prob <= 0.12 or raw_top_group == favorite_group:
-        target_group = raw_top_group
+    target_group, selection_reason = score_group_for_recommendation(match, favorite_group, raw_top_group)
 
     aligned = [
         candidate
@@ -357,6 +393,7 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         openness_adjusted,
         target_total,
         shape_context,
+        selection_reason,
     )
     return {
         "favorite_group": favorite_group,
@@ -364,6 +401,7 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
         "openness_adjusted": openness_adjusted,
         "score_shape_adjusted": score_shape_adjusted,
         "selection_kind": shape_context.get("kind") if shape_context else None,
+        "selection_reason": selection_reason,
         "short_note": shape_context.get("short_note") if shape_context else None,
         "openness_target_total": target_total,
         "raw_top_score": raw_top.get("score"),
@@ -627,6 +665,7 @@ def parlay_pool(
     restrict_clear_favorites: bool,
     max_clear_favorite_deviations: int | None,
     odds_power: float,
+    restrict_all_favorites: bool = False,
 ) -> list[dict]:
     leg_sets = []
     favorite_context = []
@@ -634,6 +673,8 @@ def parlay_pool(
         favorite_group, favorite_probability = match_favorite_group(match)
         favorite_edge = match_favorite_edge(match)
         is_clear_favorite = (
+            restrict_all_favorites
+            or
             favorite_probability >= strong_favorite_threshold
             or favorite_edge >= strong_favorite_edge_threshold
             or match_dominant_favorite(match)
@@ -649,6 +690,25 @@ def parlay_pool(
             restrict_clear_favorites,
             odds_power,
         )
+        if restrict_all_favorites:
+            favorite_eligible = [candidate for candidate in eligible if candidate["group"] == favorite_group]
+            if not favorite_eligible:
+                favorite_eligible = [
+                    candidate
+                    for candidate in match["candidates"]
+                    if candidate["group"] == favorite_group
+                    and "其它" not in candidate["score"]
+                ]
+            if favorite_eligible:
+                favorite_eligible.sort(
+                    key=lambda row: (
+                        row["blended_probability"],
+                        candidate_balance_score(row, odds_power),
+                        row["value_proxy"],
+                    ),
+                    reverse=True,
+                )
+                eligible = favorite_eligible
         leg_sets.append(eligible[:14])
     if any(not legs for legs in leg_sets):
         return []
@@ -712,6 +772,7 @@ def split_parlays(
         True,
         0,
         odds_power,
+        True,
     )
     enrich_parlays(probability_pool, 1.0)
     probability_pool.sort(
@@ -865,7 +926,9 @@ def write_markdown(result: dict) -> str:
         if not recommended_scores and match.get("recommended_score", {}).get("score"):
             recommended_scores = {match["recommended_score"]["score"]}
         for index, row in enumerate(score_rows(match, result["score_table_limit"], result["show_all_scores"]), start=1):
-            marker = "胜负一致首选" if row["score"] in recommended_scores else ""
+            marker = ""
+            if row["score"] in recommended_scores:
+                marker = "胜负一致首选" if row["group"] == recommendation.get("favorite_group") else "概率首选"
             lines.append(
                 f"| {index} | {md_cell(row['score'])} | {outcome_label(row['group'])} | "
                 f"{marker} | "

@@ -120,7 +120,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/predict_match.py --db data/
    - For Markdown output, present exactly three sections: match win/draw/loss relationships, each match's scoreline probability/expected-value table, and four-leg parlay Top 9.
    - Use `--stake` to set the stake unit for expected return/profit calculations. Use `--show-all-scores` when the user asks for a complete odds-table calculation, including `胜其它` / `平其它` / `负其它` rows.
    - Split the parlay Top 9 into three blocks: first 3 by win-probability first and odds second; next 3 by odds first while retaining a medium probability/value floor; final 3 by expected net profit / ROI with high-variance caveats.
-   - Keep the probability-first block inside clear favorites. Let odds-first and EV-first allow bounded deviations from clear-favorite outcomes (`--odds-first-max-clear-favorite-deviations`, `--ev-first-max-clear-favorite-deviations`) so strength mismatches still matter without suppressing every value candidate.
+   - Keep every leg in the probability-first block aligned with that match's blended win/draw/loss favorite, not merely clear favorites. Let odds-first and EV-first allow bounded deviations from clear-favorite outcomes (`--odds-first-max-clear-favorite-deviations`, `--ev-first-max-clear-favorite-deviations`) so strength mismatches still matter without suppressing every value candidate.
 
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.py --db data/worldcup2026.sqlite --odds-json pl/YYYY-MM-DD.json --top 9 --mode strength-aware --stake 100 --show-all-scores
@@ -138,6 +138,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.p
 - Include matchup effects ("ke zhi"/style counters): pressing versus buildup resistance, transition speed versus high defensive line, set pieces versus aerial defense, low block versus shot creation, wing overloads versus fullback weakness, and goalkeeper profile versus crossing volume.
 - Use official lineups when available. Before official lineups, model expected lineups and apply higher uncertainty.
 - Backtest score distributions and formation matchups when enough results are available; write optimized weights to `model_parameters` rather than hard-coding them.
+- When completed matches show an underweighted score tail, tune distribution-shape factors such as high-total boosts, both-teams-scoring boosts, open-draw boosts, nil-nil dampening, and low-total one-goal-win dampening; then re-run backtests before publishing.
 - Use stage/round context as an adaptive factor. Group and knockout stages can differ, but same-stage completed results should drive the multiplier; when no same-stage evidence exists, keep the stage multiplier neutral and state the uncertainty.
 
 ## Resources
