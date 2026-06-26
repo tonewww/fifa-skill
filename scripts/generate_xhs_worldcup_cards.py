@@ -318,6 +318,18 @@ DEFAULT_MATCH_SHORT = {
     "英格兰 vs 加纳": "英加",
     "巴拿马 vs 克罗地亚": "巴克",
     "哥伦比亚 vs 刚果金": "哥刚",
+    "瑞士 vs 加拿大": "瑞加",
+    "波黑 vs 卡塔尔": "波卡",
+    "苏格兰 vs 巴西": "苏巴",
+    "摩洛哥 vs 海地": "摩海",
+    "南非 vs 韩国": "南韩",
+    "捷克 vs 墨西哥": "捷墨",
+    "厄瓜多尔 vs 德国": "厄德",
+    "库拉索 vs 科特迪瓦": "库科",
+    "突尼斯 vs 荷兰": "突荷",
+    "日本 vs 瑞典": "日瑞",
+    "巴拉圭 vs 澳大利亚": "巴澳",
+    "土耳其 vs 美国": "土美",
 }
 
 
@@ -338,7 +350,8 @@ def short_parlay(parlay: dict, match_short: dict[str, str]) -> str:
 
 def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Path:
     # We might need a larger height if there are many legs making the text wrap more
-    image, draw = base_card("6 串 1 方案" if len(data["matches"]) == 6 else "4 串 1 方案", "世界杯 2026 赛前方案", "03", height=1440)
+    parlay_name = f"{len(data['matches'])} 串 1"
+    image, draw = base_card(f"{parlay_name} 方案", "世界杯 2026 赛前方案", "03", height=1440)
     groups = [
         ("前 3：稳健方向", "probability_first", COLORS["soft_green"], "更贴近胜负倾向"),
         ("中 3：进取方向", "odds_first", COLORS["soft_amber"], "保留一处冷门思路"),
@@ -380,6 +393,7 @@ def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Pat
 
 
 def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, match_short: dict[str, str]) -> Path:
+    parlay_name = f"{len(data['matches'])}串1"
     matches = []
     for match in data["matches"]:
         group, _prob = max(match["blended_wdl"].items(), key=lambda item: item[1])
@@ -405,7 +419,7 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
     body = f"""# 小红书图文文案｜{date_slug} 世界杯预测
 
 ## 笔记标题
-世界杯 {title_date} 四场赛前结论：胜负、比分、4串1方案
+世界杯 {title_date} {len(data['matches'])}场赛前结论：胜负、比分、{parlay_name}方案
 
 ## 正文
 以下只展示赛前模型结论和方案，不展开计算指标。不是投注建议。
@@ -416,7 +430,7 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
 比分首选：
 {chr(10).join(score_lines)}
 
-4串1分三组：
+{parlay_name}分三组：
 {chr(10).join(parlay_lines)}
 
 ## 话题

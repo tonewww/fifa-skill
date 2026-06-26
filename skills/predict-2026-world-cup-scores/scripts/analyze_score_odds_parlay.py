@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze exact-score odds and build four-leg parlay candidates."""
+"""Analyze exact-score odds and build multi-leg parlay candidates."""
 
 from __future__ import annotations
 
@@ -38,6 +38,30 @@ DEFAULT_TEAM_MAP = {
     "克罗地亚": "CRO",
     "哥伦比亚": "COL",
     "刚果金": "COD",
+    "瑞士": "SUI",
+    "加拿大": "CAN",
+    "波黑": "BIH",
+    "卡塔尔": "QAT",
+    "苏格兰": "SCO",
+    "巴西": "BRA",
+    "摩洛哥": "MAR",
+    "海地": "HAI",
+    "南非": "RSA",
+    "韩国": "KOR",
+    "捷克": "CZE",
+    "墨西哥": "MEX",
+    "巴拉圭": "PAR",
+    "澳大利亚": "AUS",
+    "土耳其": "TUR",
+    "美国": "USA",
+    "佛得角": "CPV",
+    "沙特": "KSA",
+    "乌拉圭": "URU",
+    "西班牙": "ESP",
+    "埃及": "EGY",
+    "伊朗": "IRN",
+    "新西兰": "NZL",
+    "比利时": "BEL",
 }
 
 
@@ -162,11 +186,48 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
     runner_up = max((float(value) for key, value in blended_wdl.items() if key != favorite_group), default=0.0)
     favorite_edge = favorite_probability - runner_up
     market_favorite_probability = float(market_wdl.get(favorite_group) or 0.0)
+    market_draw_probability = float(market_wdl.get("draw") or 0.0)
     total_delta = float(openness.get("total_delta") or 0.0)
     recent_total = openness.get("recent_total_goals")
     formation_total = openness.get("formation_total_goals")
     lambda_total = float(prediction.get("lambda_a") or 0.0) + float(prediction.get("lambda_b") or 0.0)
     signals = [float(value) for value in (recent_total, formation_total, lambda_total) if value is not None]
+    favorite_candidates = [
+        candidate
+        for candidate in match.get("candidates", [])
+        if candidate.get("group") == favorite_group
+    ]
+    market_tail_mass = 0.0
+    market_other_mass = 0.0
+    for candidate in favorite_candidates:
+        score = candidate.get("score", "")
+        if "其它" in score:
+            market_other_mass += float(candidate.get("market_probability", 0.0) or 0.0)
+            continue
+        total_goals = score_total_goals(score)
+        goals_for_winner = winner_goals(score, favorite_group)
+        if total_goals is not None and goals_for_winner is not None and (total_goals >= 4 or goals_for_winner >= 3):
+            market_tail_mass += float(candidate.get("market_probability", 0.0) or 0.0)
+
+    if (
+        favorite_probability >= 0.54
+        and (favorite_edge >= 0.20 or market_favorite_probability >= 0.68)
+        and (
+            market_tail_mass >= 0.075
+            or market_other_mass >= 0.025
+            or total_delta >= 0.18
+            or (recent_total is not None and float(recent_total) >= 3.2)
+        )
+    ):
+        target_total = max(3.4, min(4.8, sum(signals) / len(signals) if signals else lambda_total + 0.8))
+        return {
+            "kind": "dominant_tail",
+            "target_total": target_total,
+            "minimum_total": 3,
+            "minimum_winner_goals": 3,
+            "minimum_probability_ratio": 0.54,
+            "short_note": f"{outcome_label(favorite_group)}优势与大比分尾部同时存在，向3球以上胜比分扩展。",
+        }
 
     if total_delta >= 0.18 or (recent_total is not None and float(recent_total) >= 3.0 and total_delta >= 0.08):
         target_total = max(3.0, min(4.4, sum(signals) / len(signals)))
@@ -179,7 +240,10 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
             "short_note": f"开放度偏高，按{outcome_label(favorite_group)}方向上调至更高总进球。",
         }
 
-    if favorite_probability >= 0.54 or favorite_edge >= 0.22 or market_favorite_probability >= 0.75:
+    if (
+        (favorite_probability >= 0.58 or favorite_edge >= 0.24 or market_favorite_probability >= 0.75)
+        and market_draw_probability < 0.30
+    ):
         return {
             "kind": "favorite_margin",
             "target_total": max(2.2, min(3.2, lambda_total)),
@@ -203,30 +267,36 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
 
 
 def score_group_for_recommendation(match: dict, favorite_group: str, raw_top_group: str | None) -> tuple[str, str | None]:
+    if raw_top_group == favorite_group:
+        return favorite_group, None
     blended_wdl = match.get("blended_wdl") or {}
+    market_wdl = match.get("market_wdl") or {}
     prediction = match.get("prediction") or {}
     openness = prediction.get("openness") or {}
     favorite_probability = float(blended_wdl.get(favorite_group) or 0.0)
     raw_group_probability = float(blended_wdl.get(raw_top_group, 0.0) or 0.0)
-    draw_probability = float(blended_wdl.get("draw") or 0.0)
     sorted_wdl = sorted((float(value) for value in blended_wdl.values()), reverse=True)
     favorite_edge = sorted_wdl[0] - sorted_wdl[1] if len(sorted_wdl) >= 2 else 0.0
     lambda_total = float(prediction.get("lambda_a") or 0.0) + float(prediction.get("lambda_b") or 0.0)
     total_delta = float(openness.get("total_delta") or 0.0)
+    market_draw_probability = float(market_wdl.get("draw") or 0.0)
 
-    if raw_top_group == favorite_group:
-        return favorite_group, None
-    if favorite_probability - raw_group_probability <= 0.12:
-        return str(raw_top_group), "raw_group_close"
     if (
         raw_top_group == "draw"
-        and favorite_probability < 0.52
-        and favorite_edge < 0.18
-        and draw_probability >= 0.25
-        and (lambda_total >= 2.45 or total_delta >= 0.10)
+        and favorite_probability < 0.48
+        and favorite_edge < 0.17
+        and raw_group_probability >= 0.24
+        and (
+            market_draw_probability >= 0.30
+            or (lambda_total <= 2.65 and total_delta <= 0.12)
+        )
     ):
-        return "draw", "balanced_open_draw"
-    return favorite_group, None
+        return "draw", "weak_favorite_draw_protection"
+
+    # Outside the weak-favorite draw pocket, keep the published headline score
+    # aligned with the WDL headline. Raw top scores in another outcome group
+    # remain visible in the full table and the analysis note.
+    return favorite_group, "wdl_consistency"
 
 
 def score_shape_adjusted_recommendation(
@@ -290,6 +360,12 @@ def recommendation_analysis_note(
     raw_top_group = raw_top.get("group")
     if shape_context and recommended_group == favorite_group:
         kind = shape_context.get("kind")
+        if kind == "dominant_tail" and target_total is not None:
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+                f"强弱差距、赔率尾部与开放度支持更厚的大胜尾部（目标总进球约{target_total:.1f}），"
+                f"因此在{favorite_label}方向内扩展到3球以上胜比分。"
+            )
         if kind == "open" and target_total is not None:
             return (
                 f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
@@ -313,6 +389,12 @@ def recommendation_analysis_note(
             f"因此在{favorite_label}方向内上调到更高总进球比分。"
         )
     if recommended_group != favorite_group:
+        if selection_reason == "weak_favorite_draw_protection":
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
+                "但热门优势不足且平局赔率/低比分结构较强；"
+                "因此保留平局方向的原始高概率比分，避免机械改写成小胜。"
+            )
         if selection_reason == "balanced_open_draw":
             return (
                 f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
@@ -742,6 +824,43 @@ def parlay_pool(
     return parlays
 
 
+def fill_probability_first(
+    selected: list[dict],
+    matches: list[dict],
+    per_group: int,
+    strong_favorite_threshold: float,
+    strong_favorite_edge_threshold: float,
+    odds_power: float,
+) -> list[dict]:
+    if len(selected) >= per_group:
+        return selected
+    seen = {parlay_signature(parlay) for parlay in selected}
+    for min_prob, min_value in ((0.055, 0.35), (0.04, 0.20), (0.02, 0.0)):
+        pool = parlay_pool(
+            matches,
+            min_prob,
+            min_value,
+            strong_favorite_threshold,
+            strong_favorite_edge_threshold,
+            True,
+            0,
+            odds_power,
+            True,
+        )
+        enrich_parlays(pool, 1.0)
+        pool = [parlay for parlay in pool if parlay_signature(parlay) not in seen]
+        pool.sort(
+            key=lambda row: (row["blended_probability"], row["balance_score"], row["value_proxy"]),
+            reverse=True,
+        )
+        for parlay in pool:
+            selected.append(parlay)
+            seen.add(parlay_signature(parlay))
+            if len(selected) >= per_group:
+                return selected
+    return selected
+
+
 def enrich_parlays(parlays: list[dict], stake: float) -> list[dict]:
     for parlay in parlays:
         parlay.update(expected_value_fields(parlay["blended_probability"], parlay["combined_odds"], stake))
@@ -780,6 +899,14 @@ def split_parlays(
         reverse=True,
     )
     probability_first = probability_pool[:per_group]
+    probability_first = fill_probability_first(
+        probability_first,
+        matches,
+        per_group,
+        strong_favorite_threshold,
+        strong_favorite_edge_threshold,
+        odds_power,
+    )
 
     seen = {parlay_signature(parlay) for parlay in probability_first}
     odds_pool = parlay_pool(
@@ -861,6 +988,10 @@ def parlay_legs_text(parlay: dict) -> str:
     return " / ".join(f"{leg['match']} {leg['score']}" for leg in parlay["legs"])
 
 
+def parlay_label(result: dict) -> str:
+    return f"{len(result['matches'])} 串 1"
+
+
 def recommended_scores_text(match: dict) -> str:
     recommendation = match.get("recommended_score") or {}
     scores = [item.get("score") for item in recommendation.get("scores", []) if item.get("score")]
@@ -878,13 +1009,14 @@ def recommended_score_probability(match: dict) -> float:
 
 
 def write_markdown(result: dict) -> str:
+    label = parlay_label(result)
     lines = [
         f"数据口径：{result['odds_path']}；混合概率 = 模型 {format_pct(1 - result['market_weight'])} + 赔率隐含 {format_pct(result['market_weight'])}。",
         (
             f"资金口径：每注 {format_money(result['stake'])} 单位；预期返还 = 概率 × 赔率 × 每注，"
             "预期净收益 = 预期返还 - 每注，ROI = 概率 × 赔率 - 1。"
         ),
-        "说明：输出为概率和期望值分析，不是投注建议；精确比分 4 串 1 的单一命中率天然很低。",
+        f"说明：输出为概率和期望值分析，不是投注建议；精确比分 {label} 的单一命中率天然很低。",
         "",
         "## 1. 各场次的胜负关系",
         "",
@@ -938,7 +1070,7 @@ def write_markdown(result: dict) -> str:
                 f"{format_money(row['expected_return'])} | {format_money(row['expected_profit'])} | "
                 f"{format_pct(row['roi'])} |"
             )
-    lines.extend(["", "## 3. 4 串 1 的预测 Top 9"])
+    lines.extend(["", f"## 3. {label} 的预测 Top 9"])
     lines.extend(
         [
             "",
@@ -1031,13 +1163,13 @@ def main() -> None:
         "--odds-first-max-clear-favorite-deviations",
         type=int,
         default=1,
-        help="Maximum clear-favorite outcome deviations allowed in the odds-first four-leg group.",
+        help="Maximum clear-favorite outcome deviations allowed in the odds-first parlay group.",
     )
     parser.add_argument(
         "--ev-first-max-clear-favorite-deviations",
         type=int,
         default=2,
-        help="Maximum clear-favorite outcome deviations allowed in the EV-first four-leg group.",
+        help="Maximum clear-favorite outcome deviations allowed in the EV-first parlay group.",
     )
     parser.add_argument("--format", choices=["json", "markdown"], default="markdown")
     parser.add_argument("--output", help="Optional path to write the JSON or Markdown result.")

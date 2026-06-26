@@ -99,12 +99,32 @@ python3 skills/predict-2026-world-cup-scores/scripts/build_strength_table.py --d
 python3 skills/predict-2026-world-cup-scores/scripts/import_historical_results.py --db data/worldcup2026.sqlite --since 2021-01-01 --until 2026-06-20 --raw-out data/raw/2026-06-20/international_results.csv --replace-source
 ```
 
+   - During tournament matchdays, ingest just-finished FOX/FIFA score pages or boxscore URLs before recalibrating. FOX Nuxt score fields are index references; use the dedicated ingester instead of ad hoc parsing so final scores, xG, shots, shots on target, and possession are archived consistently. If only a score page is available, the script still stores final scores with source notes and leaves xG/shot fields empty.
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/ingest_fox_boxscores.py --db data/worldcup2026.sqlite --date 2026-06-24 --score-url "https://www.foxsports.com/soccer/fifa-world-cup/scores?date=2026-06-24" --boxscore-url "https://www.foxsports.com/soccer/fifa-world-cup-men-portugal-vs-uzbekistan-jun-24-2026-game-boxscore-647660?tab=boxscore"
+```
+
+   - If a day has already been verified from FIFA/media match reports, store those final scores in a local results JSON and ingest that instead of re-parsing a fragile live page.
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/ingest_results_json.py --db data/worldcup2026.sqlite --date 2026-06-26 --results-json data/results/2026-06-26.json
+```
+
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/analyze_formation_matchups.py --db data/worldcup2026.sqlite --min-sample 3
 python3 skills/predict-2026-world-cup-scores/scripts/backtest_model.py --db data/worldcup2026.sqlite --use-training-cache
 python3 skills/predict-2026-world-cup-scores/scripts/optimize_model_parameters.py --db data/worldcup2026.sqlite --grid coarse --use-training-cache --write-best
 ```
-   - The optimizer also searches WDL-prior-to-score calibration and adaptive stage/round parameters. Do not hard-code knockout score suppression; let completed same-stage samples and current matchup openness decide whether the round should lower, neutralize, or slightly raise total-goal expectation.
+   - The optimizer also searches WDL-prior-to-score calibration, high-score tail boosts, 0-0/1-1 protection, both-teams-scoring boost, and adaptive stage/round parameters. Do not hard-code knockout score suppression; let completed same-stage samples and current matchup openness decide whether the round should lower, neutralize, or slightly raise total-goal expectation.
+   - For daily tournament iteration, first compare yesterday's saved odds-analysis JSON against a source-backed results JSON. Review favorite hit rate, exact-score Top 8 coverage, actual-score probability, Brier/log-loss, and whether the publishing recommendation changed the model's raw top score in a harmful way. Use that review to decide whether to adjust parameters, recommendation rules, or data freshness before predicting the next slate.
+
+```bash
+python3 skills/predict-2026-world-cup-scores/scripts/review_completed_matches.py --analysis-json data/reports/odds-ev-YYYY-MM-DD.json --results-json data/results/YYYY-MM-DD.json --format markdown --output data/reports/postmatch-review-YYYY-MM-DD.md
+```
+
+   - When the review shows the same failure mode across a slate, prefer a narrow fix: flat favorite misses usually point to WDL calibration or stale team strength; missed draws point to draw protection/low-score correlation; missed high-total wins point to openness and tail calibration; recommendation-score misses with a correct WDL favorite point to publishing rules rather than the underlying model.
+   - Publishing rule after the 2026-06-26 review: keep the headline score aligned with the blended WDL favorite by default, but preserve an original draw top score when the WDL favorite is weak, the favorite edge is small, and the draw/low-score market structure is strong. Do not force a 2-1 or 1-2 recommendation just to match a low-confidence WDL favorite.
 
 8. Predict a match.
    - Run the script, then explain the result in the format from [references/prediction-output.md](references/prediction-output.md).
@@ -117,7 +137,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/predict_match.py --db data/
    - Treat odds as a calibration/reference layer, not betting advice.
    - Use a blended probability when exact-score odds are supplied; default is model 70%, market-implied 30%.
    - Use the default `--mode strength-aware` for parlays so matches with clear strength/market favorites stay inside the favored outcome group while still considering exact-score odds. The script treats either an absolute favorite probability or a favorite-vs-runner-up gap as a clear edge.
-   - For Markdown output, present exactly three sections: match win/draw/loss relationships, each match's scoreline probability/expected-value table, and four-leg parlay Top 9.
+   - For Markdown output, present exactly three sections: match win/draw/loss relationships, each match's scoreline probability/expected-value table, and `N 串 1` Top 9, where `N` is the number of matches in the input odds JSON.
    - Use `--stake` to set the stake unit for expected return/profit calculations. Use `--show-all-scores` when the user asks for a complete odds-table calculation, including `胜其它` / `平其它` / `负其它` rows.
    - Split the parlay Top 9 into three blocks: first 3 by win-probability first and odds second; next 3 by odds first while retaining a medium probability/value floor; final 3 by expected net profit / ROI with high-variance caveats.
    - Keep every leg in the probability-first block aligned with that match's blended win/draw/loss favorite, not merely clear favorites. Let odds-first and EV-first allow bounded deviations from clear-favorite outcomes (`--odds-first-max-clear-favorite-deviations`, `--ev-first-max-clear-favorite-deviations`) so strength mismatches still matter without suppressing every value candidate.
@@ -147,6 +167,8 @@ python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.p
 
 - `fetch_official_sources.py`: archive FIFA official pages/PDFs into dated raw files.
 - `import_historical_results.py`: import public international result rows into `fixtures` and `team_results` for calibration/backtesting.
+- `ingest_fox_boxscores.py`: archive FOX Sports score pages/boxscores and ingest completed World Cup scores plus available xG, shots, shots on target, and possession; resolves Nuxt index references before reading score fields.
+- `ingest_results_json.py`: ingest manually verified/source-backed final scores from local JSON into `fixtures` and `team_results`.
 - `ingest_fifa_squad_pdf.py`: parse FIFA SquadLists PDF into local 48-team and 1248-player baseline data.
 - `ingest_fifa_rankings.py`: import FIFA ranking CSVs or best-effort official ranking API responses and sync latest official ranks to teams.
 - `ingest_statsbomb_open_data.py`: import StatsBomb Open Data club competitions, matches, lineups, events, team/player match stats, and derived player feature snapshots for training tactical/player feature relationships.
@@ -161,6 +183,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.p
 - `export_strength_table.py`: export the latest strength table as Markdown or CSV.
 - `analyze_formation_matchups.py`: aggregate completed matches by formation pairing for tactical priors.
 - `analyze_score_odds_parlay.py`: combine exact-score odds with model probabilities, calculate expected return/profit/ROI, and rank multi-leg scoreline candidates.
+- `review_completed_matches.py`: compare saved pre-match odds analysis against completed results and summarize WDL hit rate, scoreline coverage, calibration metrics, recommendation-rule drift, and optimization priorities.
 - `backtest_model.py`: score stored predictions against completed fixtures.
 - `optimize_model_parameters.py`: grid-search model parameters and optionally store the best row.
 - `predict_match.py`: compute win/draw/loss probabilities and likely scorelines.
