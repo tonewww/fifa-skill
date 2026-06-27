@@ -173,6 +173,36 @@ def outcome_color(group: str) -> str:
     return {"home_win": COLORS["red"], "draw": COLORS["amber"], "away_win": COLORS["teal"]}.get(group, COLORS["muted"])
 
 
+def relationship_context(match: dict) -> dict:
+    relationship = match.get("relationship")
+    if relationship:
+        return relationship
+    wdl = match["blended_wdl"]
+    favorite_group, favorite_probability = max(wdl.items(), key=lambda item: item[1])
+    draw_probability = float(wdl.get("draw") or 0.0)
+    if favorite_group == "draw":
+        return {
+            "label": "平局优先",
+            "primary_group": "draw",
+            "probability_text": pct(draw_probability),
+            "note": "平局最高",
+        }
+    if draw_probability >= 0.27 and favorite_probability - draw_probability <= 0.12:
+        return {
+            "label": f"{outcome_label(favorite_group)}防平",
+            "primary_group": favorite_group,
+            "secondary_group": "draw",
+            "probability_text": f"{pct(favorite_probability)} / 平{pct(draw_probability)}",
+            "note": "防平",
+        }
+    return {
+        "label": outcome_label(favorite_group),
+        "primary_group": favorite_group,
+        "probability_text": pct(favorite_probability),
+        "note": "",
+    }
+
+
 def date_label(date_slug: str) -> str:
     parts = date_slug.split("-")
     if len(parts) >= 3:
@@ -189,15 +219,18 @@ def card_wdl(data: dict, date_slug: str, title_date: str) -> Path:
         box = (170, y, 1020, y + 238)
         rounded(draw, box, COLORS["panel"], COLORS["line"], radius=8)
         wdl = match["blended_wdl"]
-        favorite_group, favorite_probability = max(wdl.items(), key=lambda item: item[1])
+        relationship = relationship_context(match)
+        primary_group = relationship.get("primary_group") or max(wdl.items(), key=lambda item: item[1])[0]
         draw_text(draw, (196, y + 25), f"0{index}", FONTS["h3"], COLORS["red"])
         draw_text(draw, (252, y + 24), match["match"], FONTS["h2"], COLORS["ink"])
-        pill(draw, 802, y + 26, outcome_label(favorite_group), outcome_color(favorite_group), COLORS["panel"], size=24, pad_x=18, pad_y=9)
+        pill(draw, 782, y + 26, relationship["label"], outcome_color(primary_group), COLORS["panel"], size=22, pad_x=16, pad_y=9)
 
-        label = outcome_label(favorite_group)
-        color = outcome_color(favorite_group)
-        draw_text(draw, (252, y + 102), "倾向", FONTS["small"], COLORS["muted"])
-        draw_text(draw, (252, y + 130), label, font(52), color)
+        label = relationship["label"]
+        color = outcome_color(primary_group)
+        draw_text(draw, (252, y + 102), "关系", FONTS["small"], COLORS["muted"])
+        draw_text(draw, (252, y + 130), label, fit_text(draw, label, 185, 48, 30), color)
+        if relationship.get("secondary_group") == "draw":
+            draw_text(draw, (252, y + 186), "防平", FONTS["tiny"], COLORS["amber"])
 
         bar_x, bar_y, bar_w, bar_h = 462, y + 104, 478, 18
         cursor = bar_x
@@ -396,8 +429,8 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
     parlay_name = f"{len(data['matches'])}串1"
     matches = []
     for match in data["matches"]:
-        group, _prob = max(match["blended_wdl"].items(), key=lambda item: item[1])
-        matches.append(f"- {match['match']}：{outcome_label(group)}")
+        rel = relationship_context(match)
+        matches.append(f"- {match['match']}：{rel['label']}（{rel.get('probability_text', '')}）")
 
     score_lines = []
     for match in data["matches"]:

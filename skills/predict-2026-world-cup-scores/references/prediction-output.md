@@ -100,14 +100,16 @@ When exact-score odds are provided:
 
 - Show the model/market blend weights.
 - Use exactly three sections for the main Markdown output, and render all three sections as Markdown tables:
-  1. `各场次的胜负关系`: one table with match, blended win/draw/loss probabilities, favored result, and favored probability.
+  1. `各场次的胜负关系`: one table with match, blended win/draw/loss probabilities, published relationship, relationship probability, and draw warning. Use `平局优先` when draw is highest, and `主胜防平` / `客胜防平` when draw is close or the protected headline score is a draw.
   2. `各场次的比分预测 Top 8` or `各场次的完整比分概率与预期收入`: one table per match with exact scores by blended probability, including model probability, odds-implied probability, blended probability, odds, break-even probability, hit return, expected return, expected net profit, and ROI.
   3. `4 串 1 的预测 Top 9`: three tables: probability-first positions 1-3, odds-first positions 4-6, and expected-value-first positions 7-9.
 - Split the four-leg Top 9 into three ordered blocks:
   - Positions 1-3: prioritize combined blended hit probability first, then odds/balance.
   - Positions 4-6: prioritize combined decimal odds first, but keep a medium per-leg probability and value floor; allow only bounded deviations from clear-favorite outcomes.
   - Positions 7-9: prioritize expected net profit / ROI, keep leg-level probability and value floors, allow a slightly wider but still bounded clear-favorite deviation count, and label this block as high variance.
-- In strength-aware mode, when a match has a clear blended WDL favorite, filter four-leg candidates to that favorite's outcome group before ranking exact scores.
+- In strength-aware mode, when a match has a clear blended WDL favorite, filter candidates to that favorite's outcome group before ranking exact scores. For the probability-first block, use the published relationship group instead of raw WDL max so protected draw matches can keep draw scorelines.
+- For group-stage slates, include current points and goal difference in the WDL relationship table when available. If group labels are missing locally, infer the mini-group from the current slate and completed group fixtures; if the first-round data is unavailable, say the incentive sample is insufficient rather than inventing a qualification scenario.
+- Use qualification incentives as modest tactical context: leaders can become more draw/low-score tolerant, 0-point teams can become more open or margin-seeking, and 1-point teams sit between those poles. Explain the direction of the correction, but do not let it hide the raw draw probability.
 - Treat a clear favorite as either high absolute WDL probability or a large gap over the second-most likely result; football draws often keep absolute favorite probabilities below 55%.
 - Show the clear-favorite deviation count for each four-leg combination when bounded deviations are enabled.
 - For four-leg exact-score combinations, show combined decimal odds, blended hit probability, hit return, expected return, expected net profit, ROI, and a balance or value proxy.

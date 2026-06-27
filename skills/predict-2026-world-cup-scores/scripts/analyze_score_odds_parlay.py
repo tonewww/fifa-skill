@@ -7,6 +7,8 @@ import argparse
 import itertools
 import json
 import math
+import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -92,6 +94,326 @@ def flatten_odds(odds: dict) -> tuple[list[dict], dict[str, float]]:
     for row in rows:
         row["market_probability"] = row["raw"] / raw_sum if raw_sum > 0 else 0.0
     return rows, market_wdl
+
+
+def infer_analysis_date(odds_path: Path) -> str | None:
+    match = re.search(r"\d{4}-\d{2}-\d{2}", odds_path.stem)
+    return match.group(0) if match else None
+
+
+def resolve_team_id(name: str, team_map: dict[str, str]) -> str:
+    return team_map.get(name, name)
+
+
+def team_names(conn: sqlite3.Connection, team_ids: set[str]) -> dict[str, str]:
+    if not team_ids:
+        return {}
+    placeholders = ",".join("?" for _ in team_ids)
+    rows = conn.execute(
+        f"SELECT team_id, COALESCE(NULLIF(short_name, ''), NULLIF(name, ''), team_id) AS label "
+        f"FROM teams WHERE team_id IN ({placeholders})",
+        sorted(team_ids),
+    ).fetchall()
+    return {row["team_id"]: row["label"] for row in rows}
+
+
+def empty_standing(team_id: str, labels: dict[str, str]) -> dict:
+    return {
+        "team_id": team_id,
+        "team": labels.get(team_id, team_id),
+        "played": 0,
+        "wins": 0,
+        "draws": 0,
+        "losses": 0,
+        "goals_for": 0,
+        "goals_against": 0,
+        "goal_difference": 0,
+        "points": 0,
+    }
+
+
+def add_standing_result(row: dict, goals_for: int, goals_against: int) -> None:
+    row["played"] += 1
+    row["goals_for"] += goals_for
+    row["goals_against"] += goals_against
+    row["goal_difference"] = row["goals_for"] - row["goals_against"]
+    if goals_for > goals_against:
+        row["wins"] += 1
+        row["points"] += 3
+    elif goals_for == goals_against:
+        row["draws"] += 1
+        row["points"] += 1
+    else:
+        row["losses"] += 1
+
+
+def infer_group_components(db_path: Path, odds_items: list[dict], team_map: dict[str, str], as_of_date: str | None) -> dict:
+    """Infer current group components from the current slate plus completed group fixtures.
+
+    The local `teams.group_name` field is not always populated. For tournament
+    matchday work, the current slate and already-completed World Cup group-stage
+    fixtures are enough to recover the four-team mini-groups needed for tactical
+    incentive analysis.
+    """
+    current_edges: list[tuple[str, str]] = []
+    current_teams: set[str] = set()
+    for item in odds_items:
+        home_id = resolve_team_id(item["home_team"], team_map)
+        away_id = resolve_team_id(item["away_team"], team_map)
+        current_edges.append((home_id, away_id))
+        current_teams.update((home_id, away_id))
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        labels = team_names(conn, current_teams)
+        completed = conn.execute(
+            """
+            SELECT match_date, team_a_id, team_b_id, score_a, score_b
+            FROM fixtures
+            WHERE competition = 'FIFA World Cup 2026'
+              AND stage = 'Group Stage'
+              AND status = 'final'
+              AND score_a IS NOT NULL
+              AND score_b IS NOT NULL
+              AND (? IS NULL OR match_date < ?)
+            ORDER BY match_date, match_id
+            """,
+            (as_of_date, as_of_date),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    parent: dict[str, str] = {}
+
+    def find(team_id: str) -> str:
+        parent.setdefault(team_id, team_id)
+        if parent[team_id] != team_id:
+            parent[team_id] = find(parent[team_id])
+        return parent[team_id]
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for home_id, away_id in current_edges:
+        union(home_id, away_id)
+    changed = True
+    while changed:
+        changed = False
+        known_roots = {find(team_id) for team_id in current_teams}
+        known_members = set(parent)
+        for row in completed:
+            left = row["team_a_id"]
+            right = row["team_b_id"]
+            if left in known_members or right in known_members:
+                before = (find(left), find(right))
+                union(left, right)
+                current_teams.update((left, right))
+                labels.setdefault(left, left)
+                labels.setdefault(right, right)
+                after = (find(left), find(right))
+                if before != after or find(left) not in known_roots:
+                    changed = True
+
+    components: dict[str, set[str]] = {}
+    for team_id in set(parent) | current_teams:
+        components.setdefault(find(team_id), set()).add(team_id)
+
+    contexts = {}
+    for root, members in components.items():
+        standings = {team_id: empty_standing(team_id, labels) for team_id in members}
+        matches_used = []
+        for row in completed:
+            home_id = row["team_a_id"]
+            away_id = row["team_b_id"]
+            if home_id not in members or away_id not in members:
+                continue
+            home_goals = int(row["score_a"])
+            away_goals = int(row["score_b"])
+            add_standing_result(standings[home_id], home_goals, away_goals)
+            add_standing_result(standings[away_id], away_goals, home_goals)
+            matches_used.append(
+                {
+                    "date": row["match_date"],
+                    "home_team_id": home_id,
+                    "away_team_id": away_id,
+                    "score": f"{home_goals}:{away_goals}",
+                }
+            )
+        table = sorted(
+            standings.values(),
+            key=lambda item: (
+                item["points"],
+                item["goal_difference"],
+                item["goals_for"],
+                item["team"],
+            ),
+            reverse=True,
+        )
+        for rank, row in enumerate(table, start=1):
+            row["rank"] = rank
+        group_key = "-".join(sorted(members))
+        context = {
+            "group_key": group_key,
+            "as_of_date": as_of_date,
+            "inferred": True,
+            "standings": table,
+            "matches_used": matches_used,
+            "complete_enough": bool(matches_used),
+        }
+        for team_id in members:
+            contexts[team_id] = context
+    return contexts
+
+
+def team_incentive(standing: dict | None, group_context: dict | None) -> dict:
+    if not standing or not group_context or not group_context.get("complete_enough"):
+        return {
+            "status": "unknown",
+            "label": "形势样本不足",
+            "risk_delta": 0.0,
+            "draw_value": 0.0,
+            "goal_difference_pressure": 0.0,
+            "note": "本地库缺少该组已完赛积分，暂不做出线动机修正。",
+        }
+    played = int(standing.get("played") or 0)
+    points = int(standing.get("points") or 0)
+    gd = int(standing.get("goal_difference") or 0)
+    rank = int(standing.get("rank") or 0)
+    if played == 0:
+        return {
+            "status": "unknown",
+            "label": "尚无本组赛果",
+            "risk_delta": 0.0,
+            "draw_value": 0.0,
+            "goal_difference_pressure": 0.0,
+            "note": "该组赛果样本不足，保持基础模型判断。",
+        }
+    if points >= 3 and gd >= 2:
+        return {
+            "status": "protect_position",
+            "label": "领先且净胜球占优",
+            "risk_delta": -0.05,
+            "draw_value": 0.08,
+            "goal_difference_pressure": -0.02,
+            "note": "已有3分且净胜球较好，平局价值提高，战术上更可能控制风险。",
+        }
+    if points >= 3:
+        return {
+            "status": "draw_ok",
+            "label": "已有3分，平局可接受",
+            "risk_delta": -0.035,
+            "draw_value": 0.06,
+            "goal_difference_pressure": 0.0,
+            "note": "已有3分，第二轮不必过度冒险，平局和低比分权重上调。",
+        }
+    if points == 1:
+        return {
+            "status": "balanced_need_win",
+            "label": "1分在手，争胜但不能崩盘",
+            "risk_delta": 0.025,
+            "draw_value": 0.02,
+            "goal_difference_pressure": 0.02 if gd < 0 else 0.0,
+            "note": "只有1分，需要争取胜利，但平局仍有保底价值。",
+        }
+    if gd <= -2:
+        return {
+            "status": "chasing_goal_difference",
+            "label": "0分且净胜球落后",
+            "risk_delta": 0.085,
+            "draw_value": -0.05,
+            "goal_difference_pressure": 0.08,
+            "note": "0分且净胜球落后，抢分和追净胜球压力都会提高比赛开放度。",
+        }
+    return {
+        "status": "need_points",
+        "label": "0分，需要抢分",
+        "risk_delta": 0.06,
+        "draw_value": -0.025,
+        "goal_difference_pressure": 0.035,
+        "note": "首轮0分，第二轮拿分压力增加，落后时更可能主动提速。",
+    }
+
+
+def group_context_for_match(home_id: str, away_id: str, contexts: dict[str, dict]) -> dict:
+    context = contexts.get(home_id) or contexts.get(away_id)
+    standings_by_id = {
+        row["team_id"]: row
+        for row in (context or {}).get("standings", [])
+    }
+    home_incentive = team_incentive(standings_by_id.get(home_id), context)
+    away_incentive = team_incentive(standings_by_id.get(away_id), context)
+    return {
+        "group_key": (context or {}).get("group_key"),
+        "as_of_date": (context or {}).get("as_of_date"),
+        "inferred": bool((context or {}).get("inferred")),
+        "complete_enough": bool((context or {}).get("complete_enough")),
+        "standings": (context or {}).get("standings", []),
+        "matches_used": (context or {}).get("matches_used", []),
+        "home": standings_by_id.get(home_id),
+        "away": standings_by_id.get(away_id),
+        "home_incentive": home_incentive,
+        "away_incentive": away_incentive,
+    }
+
+
+def normalize_probabilities(values: dict[str, float]) -> dict[str, float]:
+    total = sum(max(value, 0.0) for value in values.values())
+    if total <= 0:
+        return values
+    return {key: max(value, 0.0) / total for key, value in values.items()}
+
+
+def tactical_wdl_adjustment(context: dict) -> dict:
+    home = context.get("home_incentive") or {}
+    away = context.get("away_incentive") or {}
+    home_risk = float(home.get("risk_delta") or 0.0)
+    away_risk = float(away.get("risk_delta") or 0.0)
+    home_draw_value = float(home.get("draw_value") or 0.0)
+    away_draw_value = float(away.get("draw_value") or 0.0)
+    home_gd = float(home.get("goal_difference_pressure") or 0.0)
+    away_gd = float(away.get("goal_difference_pressure") or 0.0)
+    draw_boost = 0.55 * (home_draw_value + away_draw_value) - 0.30 * max(home_risk + away_risk, 0.0)
+    home_win_boost = 0.50 * home_risk + 0.30 * home_gd + 0.12 * max(away_draw_value, 0.0)
+    away_win_boost = 0.50 * away_risk + 0.30 * away_gd + 0.12 * max(home_draw_value, 0.0)
+    multipliers = {
+        "home_win": max(0.88, min(1.14, 1.0 + home_win_boost)),
+        "draw": max(0.86, min(1.14, 1.0 + draw_boost)),
+        "away_win": max(0.88, min(1.14, 1.0 + away_win_boost)),
+    }
+    if home.get("status") == "unknown" and away.get("status") == "unknown":
+        multipliers = {"home_win": 1.0, "draw": 1.0, "away_win": 1.0}
+    notes = []
+    if home.get("label"):
+        notes.append(f"主队{home['label']}")
+    if away.get("label"):
+        notes.append(f"客队{away['label']}")
+    return {
+        "wdl_multipliers": multipliers,
+        "home_risk_delta": home_risk,
+        "away_risk_delta": away_risk,
+        "draw_boost": draw_boost,
+        "note": "；".join(notes),
+    }
+
+
+def adjusted_candidate_probability(candidate: dict, base_probability: float, adjustment: dict) -> float:
+    multipliers = adjustment.get("wdl_multipliers") or {}
+    probability = base_probability * float(multipliers.get(candidate.get("group"), 1.0))
+    total_goals = score_total_goals(candidate.get("score", ""))
+    if total_goals is None:
+        return probability
+    home_risk = float(adjustment.get("home_risk_delta") or 0.0)
+    away_risk = float(adjustment.get("away_risk_delta") or 0.0)
+    draw_boost = float(adjustment.get("draw_boost") or 0.0)
+    if total_goals >= 3 and home_risk + away_risk > 0.06:
+        probability *= 1.0 + min(0.08, 0.45 * (home_risk + away_risk))
+    if total_goals <= 2 and draw_boost > 0.04:
+        probability *= 1.0 + min(0.06, 0.45 * draw_boost)
+    return probability
 
 
 def expected_value_fields(probability: float, odds: float, stake: float) -> dict:
@@ -504,14 +826,23 @@ def recommended_score_candidates(match: dict, tie_tolerance: float = 0.0005) -> 
     }
 
 
-def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_weight: float, stake: float) -> dict:
+def analyze_match(
+    db_path: Path,
+    item: dict,
+    team_map: dict[str, str],
+    market_weight: float,
+    stake: float,
+    group_contexts: dict[str, dict] | None = None,
+) -> dict:
     home_name = item["home_team"]
     away_name = item["away_team"]
-    home_id = team_map.get(home_name, home_name)
-    away_id = team_map.get(away_name, away_name)
+    home_id = resolve_team_id(home_name, team_map)
+    away_id = resolve_team_id(away_name, team_map)
     result = predict(db_path, home_id, away_id, "Group Stage", True, False)
     dist = score_distribution(result)
     flat, market_wdl = flatten_odds(item["odds"])
+    standings_context = group_context_for_match(home_id, away_id, group_contexts or {})
+    tactical_adjustment = tactical_wdl_adjustment(standings_context)
     
     # Keep the requested model/market blend stable by default. Data-readiness
     # penalties are exposed as a diagnostic instead of silently changing 70/30.
@@ -534,6 +865,12 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         group: model_weight * model_wdl[group] + dynamic_market_weight * market_wdl[group]
         for group in ("home_win", "draw", "away_win")
     }
+    blend_wdl = normalize_probabilities(
+        {
+            group: probability * tactical_adjustment["wdl_multipliers"].get(group, 1.0)
+            for group, probability in blend_wdl.items()
+        }
+    )
     model_group_probability = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
     for score, probability in dist.items():
         group = score_group(score)
@@ -555,6 +892,7 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         else:
             model_probability = dist.get(row["score"], 0.0)
         blended_probability = model_weight * model_probability + dynamic_market_weight * row["market_probability"]
+        blended_probability = adjusted_candidate_probability(row, blended_probability, tactical_adjustment)
         candidate = {
             "match": f"{home_name} vs {away_name}",
             "home_team": home_name,
@@ -582,8 +920,11 @@ def analyze_match(db_path: Path, item: dict, team_map: dict[str, str], market_we
         "market_weight": dynamic_market_weight,
         "data_readiness_market_penalty": penalty,
         "data_readiness_market_weight_if_enabled": min(0.85, market_weight + penalty),
+        "standings_context": standings_context,
+        "tactical_adjustment": tactical_adjustment,
     }
     match["recommended_score"] = recommended_score_candidates(match)
+    match["relationship"] = relationship_context(match)
     return match
 
 
@@ -597,6 +938,71 @@ def match_favorite_group(match: dict) -> tuple[str, float]:
         key=lambda item: item[1],
     )
     return favorite_group, favorite_probability
+
+
+def relationship_context(match: dict) -> dict:
+    wdl = match.get("blended_wdl") or {}
+    favorite_group, favorite_probability = match_favorite_group(match)
+    draw_probability = float(wdl.get("draw") or 0.0)
+    recommendation = match.get("recommended_score") or {}
+    recommended_group = recommendation.get("group")
+    selection_reason = recommendation.get("selection_reason")
+    favorite_edge_to_draw = favorite_probability - draw_probability if favorite_group != "draw" else 0.0
+    draw_protected = (
+        favorite_group != "draw"
+        and recommended_group == "draw"
+        and selection_reason == "weak_favorite_draw_protection"
+    )
+    close_draw = (
+        favorite_group != "draw"
+        and draw_probability >= 0.27
+        and favorite_edge_to_draw <= 0.12
+    )
+
+    if favorite_group == "draw":
+        return {
+            "label": "平局优先",
+            "primary_group": "draw",
+            "secondary_group": None,
+            "probability": draw_probability,
+            "probability_text": format_pct(draw_probability),
+            "probability_first_group": "draw",
+            "note": "平局是最高概率结果。",
+        }
+    if draw_protected:
+        return {
+            "label": f"{outcome_label(favorite_group)}防平",
+            "primary_group": favorite_group,
+            "secondary_group": "draw",
+            "probability": favorite_probability,
+            "probability_text": f"{format_pct(favorite_probability)} / 平{format_pct(draw_probability)}",
+            "probability_first_group": "draw",
+            "note": "首选比分落在平局，稳健组按防平处理。",
+        }
+    if close_draw:
+        return {
+            "label": f"{outcome_label(favorite_group)}防平",
+            "primary_group": favorite_group,
+            "secondary_group": "draw",
+            "probability": favorite_probability,
+            "probability_text": f"{format_pct(favorite_probability)} / 平{format_pct(draw_probability)}",
+            "probability_first_group": favorite_group,
+            "note": "平局概率接近头名，需要防平。",
+        }
+    return {
+        "label": outcome_label(favorite_group),
+        "primary_group": favorite_group,
+        "secondary_group": None,
+        "probability": favorite_probability,
+        "probability_text": format_pct(favorite_probability),
+        "probability_first_group": favorite_group,
+        "note": "",
+    }
+
+
+def match_probability_first_group(match: dict) -> str:
+    relationship = match.get("relationship") or relationship_context(match)
+    return str(relationship.get("probability_first_group") or match_favorite_group(match)[0])
 
 
 def match_favorite_edge(match: dict) -> float:
@@ -753,6 +1159,7 @@ def parlay_pool(
     favorite_context = []
     for match in matches:
         favorite_group, favorite_probability = match_favorite_group(match)
+        filter_group = match_probability_first_group(match) if restrict_all_favorites else favorite_group
         favorite_edge = match_favorite_edge(match)
         is_clear_favorite = (
             restrict_all_favorites
@@ -761,7 +1168,7 @@ def parlay_pool(
             or favorite_edge >= strong_favorite_edge_threshold
             or match_dominant_favorite(match)
         )
-        favorite_context.append((is_clear_favorite, favorite_group))
+        favorite_context.append((is_clear_favorite, filter_group))
         eligible = eligible_candidates(
             match,
             min_leg_probability,
@@ -773,12 +1180,12 @@ def parlay_pool(
             odds_power,
         )
         if restrict_all_favorites:
-            favorite_eligible = [candidate for candidate in eligible if candidate["group"] == favorite_group]
+            favorite_eligible = [candidate for candidate in eligible if candidate["group"] == filter_group]
             if not favorite_eligible:
                 favorite_eligible = [
                     candidate
                     for candidate in match["candidates"]
-                    if candidate["group"] == favorite_group
+                    if candidate["group"] == filter_group
                     and "其它" not in candidate["score"]
                 ]
             if favorite_eligible:
@@ -977,6 +1384,42 @@ def outcome_label(group: str) -> str:
     }.get(group, group)
 
 
+def standing_brief(row: dict | None) -> str:
+    if not row:
+        return "无积分样本"
+    return (
+        f"{row.get('team', row.get('team_id'))} "
+        f"{row.get('points', 0)}分/{row.get('played', 0)}场/"
+        f"净胜{int(row.get('goal_difference', 0)):+d}"
+    )
+
+
+def standings_context_text(match: dict) -> str:
+    context = match.get("standings_context") or {}
+    home = context.get("home") or {}
+    away = context.get("away") or {}
+    home_incentive = context.get("home_incentive") or {}
+    away_incentive = context.get("away_incentive") or {}
+    if not context.get("complete_enough"):
+        return "本地小组积分样本不足，未做出线动机修正"
+    return (
+        f"{standing_brief(home)}（{home_incentive.get('label', '形势未知')}）；"
+        f"{standing_brief(away)}（{away_incentive.get('label', '形势未知')}）"
+    )
+
+
+def tactical_adjustment_text(match: dict) -> str:
+    adjustment = match.get("tactical_adjustment") or {}
+    multipliers = adjustment.get("wdl_multipliers") or {}
+    if not multipliers or all(abs(float(value) - 1.0) < 0.005 for value in multipliers.values()):
+        return ""
+    return (
+        f"出线动机修正：主胜x{multipliers.get('home_win', 1.0):.2f}、"
+        f"平局x{multipliers.get('draw', 1.0):.2f}、"
+        f"客胜x{multipliers.get('away_win', 1.0):.2f}。"
+    )
+
+
 def score_rows(match: dict, limit: int = 8, show_all: bool = False) -> list[dict]:
     rows = sorted(match["candidates"], key=lambda row: row["blended_probability"], reverse=True)
     if show_all:
@@ -1020,16 +1463,18 @@ def write_markdown(result: dict) -> str:
         "",
         "## 1. 各场次的胜负关系",
         "",
-        "| 场次 | 主胜 | 平局 | 客胜 | 倾向 | 倾向概率 |",
-        "|---|---:|---:|---:|---|---:|",
+        "| 场次 | 主胜 | 平局 | 客胜 | 胜平负关系 | 关系概率 | 积分/净胜球与出线动机 | 平局提示 |",
+        "|---|---:|---:|---:|---|---:|---|---|",
     ]
     for match in result["matches"]:
         wdl = match["blended_wdl"]
-        favorite_group, favorite_probability = match_favorite_group(match)
+        relationship = match.get("relationship") or relationship_context(match)
         lines.append(
             f"| {md_cell(match['match'])} | {format_pct(wdl['home_win'])} | "
             f"{format_pct(wdl['draw'])} | {format_pct(wdl['away_win'])} | "
-            f"{outcome_label(favorite_group)} | {format_pct(favorite_probability)} |"
+            f"{md_cell(relationship['label'])} | {relationship['probability_text']} | "
+            f"{md_cell(standings_context_text(match))} | "
+            f"{md_cell(relationship.get('note') or '')} |"
         )
     score_title = "## 2. 各场次的完整比分概率与预期收入" if result["show_all_scores"] else "## 2. 各场次的比分预测 Top 8 与预期收入"
     lines.extend(["", score_title])
@@ -1044,6 +1489,7 @@ def write_markdown(result: dict) -> str:
                     f"推荐说明：首选比分 {md_cell(recommended_scores_text(match))}"
                     f"（混合概率 {format_pct(recommended_score_probability(match))}）；"
                     f"{md_cell(recommendation.get('analysis_note', '按胜负倾向内最高概率比分输出。'))}"
+                    f"{md_cell(tactical_adjustment_text(match))}"
                 ),
                 "",
                 "| 序号 | 比分 | 结果 | 推荐 | 模型概率 | 赔率隐含 | 混合概率 | 赔率 | 盈亏平衡 | 命中返还 | 预期返还 | 预期净收益 | ROI |",
@@ -1180,7 +1626,12 @@ def main() -> None:
     team_map = DEFAULT_TEAM_MAP.copy()
     if args.team_map_json:
         team_map.update(json.loads(Path(args.team_map_json).read_text(encoding="utf-8")))
-    matches = [analyze_match(Path(args.db), item, team_map, args.market_weight, args.stake) for item in odds_items]
+    analysis_date = infer_analysis_date(odds_path)
+    group_contexts = infer_group_components(Path(args.db), odds_items, team_map, analysis_date)
+    matches = [
+        analyze_match(Path(args.db), item, team_map, args.market_weight, args.stake, group_contexts)
+        for item in odds_items
+    ]
     parlays = build_parlays(
         matches,
         args.min_leg_probability,
@@ -1225,6 +1676,7 @@ def main() -> None:
         "odds_first_max_clear_favorite_deviations": args.odds_first_max_clear_favorite_deviations,
         "ev_first_max_clear_favorite_deviations": args.ev_first_max_clear_favorite_deviations,
         "odds_power": args.odds_power,
+        "analysis_date": analysis_date,
         "matches": matches,
         "parlays": parlays,
         "parlay_groups": parlay_groups,

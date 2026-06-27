@@ -125,22 +125,35 @@ python3 skills/predict-2026-world-cup-scores/scripts/review_completed_matches.py
 
    - When the review shows the same failure mode across a slate, prefer a narrow fix: flat favorite misses usually point to WDL calibration or stale team strength; missed draws point to draw protection/low-score correlation; missed high-total wins point to openness and tail calibration; recommendation-score misses with a correct WDL favorite point to publishing rules rather than the underlying model.
    - Publishing rule after the 2026-06-26 review: keep the headline score aligned with the blended WDL favorite by default, but preserve an original draw top score when the WDL favorite is weak, the favorite edge is small, and the draw/low-score market structure is strong. Do not force a 2-1 or 1-2 recommendation just to match a low-confidence WDL favorite.
+   - Publishing rule after the 2026-06-27 review: do not collapse WDL relationships into only win/loss labels. If draw is the highest probability, publish `平局优先`; if draw is close to a weak favorite or the protected headline score is a draw, publish `主胜防平` / `客胜防平` and allow the probability-first parlay block to use draw scorelines. When favorites win by high margins that were outside Top 8, inspect openness, strength mismatch, and group-stage goal-difference pressure before suppressing 3+ goal tails.
 
-8. Predict a match.
+8. Add group standing and qualification incentive context before predicting group-stage slates.
+   - Ingest the latest completed match results before analyzing the next odds JSON.
+   - Compute current group standings from completed World Cup group fixtures: played, points, goals for/against, goal difference, and rank. If `teams.group_name` is missing, infer the mini-group from the current slate plus already-completed group-stage fixtures instead of ignoring standings.
+   - Translate standings into modest tactical incentives:
+     - teams on 3 points with healthy goal difference can value a draw and control risk;
+     - teams on 0 points need to chase points, and if goal difference is already poor they may also chase margin;
+     - teams on 1 point need to win but should not be treated as reckless by default;
+     - when the local data lacks the group's first-round result, mark the incentive as unknown and avoid a fake correction.
+   - Apply these incentives as small WDL and score-shape adjustments only. They should explain likely tactical choice and game state pressure, not override team strength, market odds, injuries, or matchup effects.
+   - In Markdown odds reports, show the current points/goal-difference context in the WDL relationship table so draw protection, conservative favorites, and high-total tails are auditable.
+
+9. Predict a match.
    - Run the script, then explain the result in the format from [references/prediction-output.md](references/prediction-output.md).
 
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/predict_match.py --db data/worldcup2026.sqlite --team-a BRA --team-b FRA --stage "Group Stage" --format report
 ```
 
-9. Analyze exact-score odds when the user provides a local odds JSON.
+10. Analyze exact-score odds when the user provides a local odds JSON.
    - Treat odds as a calibration/reference layer, not betting advice.
    - Use a blended probability when exact-score odds are supplied; default is model 70%, market-implied 30%.
    - Use the default `--mode strength-aware` for parlays so matches with clear strength/market favorites stay inside the favored outcome group while still considering exact-score odds. The script treats either an absolute favorite probability or a favorite-vs-runner-up gap as a clear edge.
    - For Markdown output, present exactly three sections: match win/draw/loss relationships, each match's scoreline probability/expected-value table, and `N 串 1` Top 9, where `N` is the number of matches in the input odds JSON.
+   - The win/draw/loss relationship table must not hide draws. If draw is the highest WDL probability, label the relationship `平局优先`. If draw is close to a weak home/away favorite or the selected headline score is a protected draw, label it `主胜防平` or `客胜防平` and show both the favorite probability and draw probability.
    - Use `--stake` to set the stake unit for expected return/profit calculations. Use `--show-all-scores` when the user asks for a complete odds-table calculation, including `胜其它` / `平其它` / `负其它` rows.
    - Split the parlay Top 9 into three blocks: first 3 by win-probability first and odds second; next 3 by odds first while retaining a medium probability/value floor; final 3 by expected net profit / ROI with high-variance caveats.
-   - Keep every leg in the probability-first block aligned with that match's blended win/draw/loss favorite, not merely clear favorites. Let odds-first and EV-first allow bounded deviations from clear-favorite outcomes (`--odds-first-max-clear-favorite-deviations`, `--ev-first-max-clear-favorite-deviations`) so strength mismatches still matter without suppressing every value candidate.
+   - Keep every leg in the probability-first block aligned with that match's published relationship, not blindly with raw WDL max. For `平局优先` and protected `主胜防平` / `客胜防平` matches, allow the probability-first block to use the draw group. Let odds-first and EV-first allow bounded deviations from clear-favorite outcomes (`--odds-first-max-clear-favorite-deviations`, `--ev-first-max-clear-favorite-deviations`) so strength mismatches still matter without suppressing every value candidate.
 
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.py --db data/worldcup2026.sqlite --odds-json pl/YYYY-MM-DD.json --top 9 --mode strength-aware --stake 100 --show-all-scores
