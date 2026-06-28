@@ -287,6 +287,14 @@ def score_explanation(match: dict) -> str:
     if not favorite_group:
         favorite_group = max(match["blended_wdl"].items(), key=lambda item: item[1])[0]
     favorite_label = outcome_label(favorite_group)
+    selection_kind = recommendation.get("selection_kind")
+    if selection_kind == "dominant_tail":
+        return f"说明：{favorite_label}优势叠加尾部信号，保留大胜比分。"
+    if selection_kind == "matchday_tail":
+        return f"说明：同阶段高比分升温，{favorite_label}方向上调。"
+    selection_reason = recommendation.get("selection_reason")
+    if selection_reason == "weak_favorite_draw_protection":
+        return f"说明：热门优势不足，平局结构强，按防平保留。"
     raw_top_score = recommendation.get("raw_top_score")
     raw_top_group = recommendation.get("raw_top_group")
     if recommendation.get("openness_adjusted"):
@@ -363,6 +371,16 @@ DEFAULT_MATCH_SHORT = {
     "日本 vs 瑞典": "日瑞",
     "巴拉圭 vs 澳大利亚": "巴澳",
     "土耳其 vs 美国": "土美",
+    "克罗地亚 vs 加纳": "克加",
+    "巴拿马 vs 英格兰": "巴英",
+    "哥伦比亚 vs 葡萄牙": "哥葡",
+    "刚果金 vs 乌兹别克": "刚乌",
+    "阿尔及利亚 vs 奥地利": "阿尔奥",
+    "约旦 vs 阿根廷": "约阿根",
+    "南非 vs 加拿大": "南加",
+    "巴西 vs 日本": "巴日",
+    "德国 vs 巴拉圭": "德巴",
+    "荷兰 vs 摩洛哥": "荷摩",
 }
 
 

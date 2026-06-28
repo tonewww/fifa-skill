@@ -513,6 +513,17 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
     recent_total = openness.get("recent_total_goals")
     formation_total = openness.get("formation_total_goals")
     lambda_total = float(prediction.get("lambda_a") or 0.0) + float(prediction.get("lambda_b") or 0.0)
+    stage_context = ((prediction.get("lambda_components") or {}).get("stage_context") or {})
+    stage_tail_boost = float(stage_context.get("score_tail_boost") or 0.0)
+    stage_blowout_share = float(stage_context.get("blowout_share") or 0.0)
+    strength_edge = 0.0
+    strength = prediction.get("strength") or {}
+    team_a_id = ((prediction.get("team_a") or {}).get("team_id"))
+    team_b_id = ((prediction.get("team_b") or {}).get("team_id"))
+    if team_a_id in strength and team_b_id in strength:
+        overall_a = float(strength[team_a_id].get("overall") or 0.0)
+        overall_b = float(strength[team_b_id].get("overall") or 0.0)
+        strength_edge = overall_a - overall_b if favorite_group == "home_win" else overall_b - overall_a
     signals = [float(value) for value in (recent_total, formation_total, lambda_total) if value is not None]
     favorite_candidates = [
         candidate
@@ -531,24 +542,52 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
         if total_goals is not None and goals_for_winner is not None and (total_goals >= 4 or goals_for_winner >= 3):
             market_tail_mass += float(candidate.get("market_probability", 0.0) or 0.0)
 
+    high_tail_environment = (
+        stage_tail_boost >= 0.035
+        or stage_blowout_share >= 0.18
+        or market_tail_mass >= 0.085
+        or total_delta >= 0.16
+    )
     if (
-        favorite_probability >= 0.54
-        and (favorite_edge >= 0.20 or market_favorite_probability >= 0.68)
+        favorite_probability >= 0.50
         and (
-            market_tail_mass >= 0.075
+            favorite_edge >= 0.16
+            or market_favorite_probability >= 0.62
+            or strength_edge >= 5.5
+        )
+        and (
+            market_tail_mass >= 0.065
             or market_other_mass >= 0.025
             or total_delta >= 0.18
             or (recent_total is not None and float(recent_total) >= 3.2)
+            or stage_tail_boost >= 0.035
         )
     ):
-        target_total = max(3.4, min(4.8, sum(signals) / len(signals) if signals else lambda_total + 0.8))
+        target_seed = sum(signals) / len(signals) if signals else lambda_total + 0.8
+        target_total = max(3.4, min(5.0, target_seed + 0.35 * min(stage_tail_boost / 0.08, 1.0)))
         return {
             "kind": "dominant_tail",
             "target_total": target_total,
             "minimum_total": 3,
             "minimum_winner_goals": 3,
-            "minimum_probability_ratio": 0.54,
+            "minimum_probability_ratio": 0.48 if high_tail_environment else 0.56,
             "short_note": f"{outcome_label(favorite_group)}优势与大比分尾部同时存在，向3球以上胜比分扩展。",
+        }
+
+    if (
+        favorite_probability >= 0.45
+        and favorite_edge >= 0.12
+        and high_tail_environment
+        and market_draw_probability < 0.30
+    ):
+        target_seed = sum(signals) / len(signals) if signals else lambda_total + 0.45
+        return {
+            "kind": "matchday_tail",
+            "target_total": max(3.0, min(4.6, target_seed + 0.25)),
+            "minimum_total": 3,
+            "minimum_winner_goals": 2,
+            "minimum_probability_ratio": 0.60,
+            "short_note": f"小组赛高比分尾部升温，{outcome_label(favorite_group)}方向保留更高比分。",
         }
 
     if total_delta >= 0.18 or (recent_total is not None and float(recent_total) >= 3.0 and total_delta >= 0.08):
@@ -571,7 +610,7 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
             "target_total": max(2.2, min(3.2, lambda_total)),
             "minimum_total": 2,
             "minimum_winner_goals": 2,
-            "minimum_probability_ratio": 0.72,
+            "minimum_probability_ratio": 0.64 if high_tail_environment else 0.72,
             "short_note": f"{outcome_label(favorite_group)}优势较清晰，优先考虑2球起步的胜比分。",
         }
 
@@ -693,6 +732,12 @@ def recommendation_analysis_note(
                 f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
                 f"近期与阵型对位指向开放比赛（目标总进球约{target_total:.1f}），"
                 f"因此在{favorite_label}方向内上调到更高总进球比分。"
+            )
+        if kind == "matchday_tail" and target_total is not None:
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}）；"
+                f"同阶段已完赛样本的大比分/大胜尾部升温（目标总进球约{target_total:.1f}），"
+                f"因此在{favorite_label}方向内保留更高比分。"
             )
         if kind == "favorite_margin":
             return (
@@ -832,13 +877,14 @@ def analyze_match(
     team_map: dict[str, str],
     market_weight: float,
     stake: float,
+    stage: str,
     group_contexts: dict[str, dict] | None = None,
 ) -> dict:
     home_name = item["home_team"]
     away_name = item["away_team"]
     home_id = resolve_team_id(home_name, team_map)
     away_id = resolve_team_id(away_name, team_map)
-    result = predict(db_path, home_id, away_id, "Group Stage", True, False)
+    result = predict(db_path, home_id, away_id, stage, True, False)
     dist = score_distribution(result)
     flat, market_wdl = flatten_odds(item["odds"])
     standings_context = group_context_for_match(home_id, away_id, group_contexts or {})
@@ -1395,6 +1441,9 @@ def standing_brief(row: dict | None) -> str:
 
 
 def standings_context_text(match: dict) -> str:
+    stage = str((match.get("prediction") or {}).get("stage") or "")
+    if "group" not in stage.lower():
+        return f"{stage or '淘汰赛'}口径：不套用小组积分/出线动机修正"
     context = match.get("standings_context") or {}
     home = context.get("home") or {}
     away = context.get("away") or {}
@@ -1536,7 +1585,7 @@ def write_markdown(result: dict) -> str:
     lines.extend(
         [
             "",
-            "### 后 3 个：赔率优先，胜率保持中等门槛",
+            "### 中 3 个：赔率优先，胜率保持中等门槛",
             "",
             "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
             "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -1575,6 +1624,7 @@ def main() -> None:
     parser.add_argument("--team-map-json", help="Optional JSON object mapping odds names to team ids.")
     parser.add_argument("--market-weight", type=float, default=0.30, help="Weight for odds-implied probabilities.")
     parser.add_argument("--stake", type=float, default=1.0, help="Stake unit used for expected return/profit calculations.")
+    parser.add_argument("--stage", default="Group Stage", help="Match stage passed to the model, e.g. 'Group Stage' or 'Round of 32'.")
     parser.add_argument("--score-table-limit", type=int, default=8, help="Rows per match when not showing all scores.")
     parser.add_argument("--show-all-scores", action="store_true", help="Show every exact-score row from the odds table.")
     parser.add_argument("--min-leg-probability", type=float, default=0.04)
@@ -1622,14 +1672,24 @@ def main() -> None:
     args = parser.parse_args()
 
     odds_path = Path(args.odds_json)
-    odds_items = json.loads(odds_path.read_text(encoding="utf-8"))
+    odds_payload = json.loads(odds_path.read_text(encoding="utf-8"))
+    if isinstance(odds_payload, dict) and "home_team" in odds_payload and "away_team" in odds_payload:
+        odds_items = [odds_payload]
+    elif isinstance(odds_payload, dict) and isinstance(odds_payload.get("matches"), list):
+        odds_items = odds_payload["matches"]
+    else:
+        odds_items = odds_payload
+    if not isinstance(odds_items, list):
+        raise SystemExit("Odds JSON must be a match object, a list of match objects, or an object with a 'matches' list.")
     team_map = DEFAULT_TEAM_MAP.copy()
     if args.team_map_json:
         team_map.update(json.loads(Path(args.team_map_json).read_text(encoding="utf-8")))
     analysis_date = infer_analysis_date(odds_path)
-    group_contexts = infer_group_components(Path(args.db), odds_items, team_map, analysis_date)
+    group_contexts = {}
+    if "group" in args.stage.lower():
+        group_contexts = infer_group_components(Path(args.db), odds_items, team_map, analysis_date)
     matches = [
-        analyze_match(Path(args.db), item, team_map, args.market_weight, args.stake, group_contexts)
+        analyze_match(Path(args.db), item, team_map, args.market_weight, args.stake, args.stage, group_contexts)
         for item in odds_items
     ]
     parlays = build_parlays(
@@ -1677,6 +1737,7 @@ def main() -> None:
         "ev_first_max_clear_favorite_deviations": args.ev_first_max_clear_favorite_deviations,
         "odds_power": args.odds_power,
         "analysis_date": analysis_date,
+        "stage": args.stage,
         "matches": matches,
         "parlays": parlays,
         "parlay_groups": parlay_groups,

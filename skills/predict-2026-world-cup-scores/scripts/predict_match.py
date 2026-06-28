@@ -720,7 +720,13 @@ def stage_family(stage: str | None) -> str:
 
 def stage_completed_goal_profile(conn, family: str) -> dict:
     if not table_exists(conn, "fixtures"):
-        return {"sample_size": 0, "avg_total_goals": None}
+        return {
+            "sample_size": 0,
+            "avg_total_goals": None,
+            "high_total_share": 0.0,
+            "very_high_total_share": 0.0,
+            "blowout_share": 0.0,
+        }
     rows = conn.execute(
         """
         SELECT stage, score_a, score_b
@@ -731,12 +737,29 @@ def stage_completed_goal_profile(conn, family: str) -> dict:
         """
     ).fetchall()
     totals = []
+    margins = []
     for row in rows:
         if stage_family(row["stage"]) == family:
-            totals.append(float(row["score_a"] or 0) + float(row["score_b"] or 0))
+            score_a = float(row["score_a"] or 0)
+            score_b = float(row["score_b"] or 0)
+            totals.append(score_a + score_b)
+            margins.append(abs(score_a - score_b))
     if not totals:
-        return {"sample_size": 0, "avg_total_goals": None}
-    return {"sample_size": len(totals), "avg_total_goals": sum(totals) / len(totals)}
+        return {
+            "sample_size": 0,
+            "avg_total_goals": None,
+            "high_total_share": 0.0,
+            "very_high_total_share": 0.0,
+            "blowout_share": 0.0,
+        }
+    sample_size = len(totals)
+    return {
+        "sample_size": sample_size,
+        "avg_total_goals": sum(totals) / sample_size,
+        "high_total_share": sum(1 for total in totals if total >= 4) / sample_size,
+        "very_high_total_share": sum(1 for total in totals if total >= 5) / sample_size,
+        "blowout_share": sum(1 for margin in margins if margin >= 3) / sample_size,
+    }
 
 
 def stage_goal_context(
@@ -752,6 +775,9 @@ def stage_goal_context(
     baseline_total = float(params.get("openness_baseline_total", 2.55) or 2.55)
     sample_size = int(profile["sample_size"] or 0)
     avg_total_goals = profile["avg_total_goals"]
+    high_total_share = float(profile.get("high_total_share") or 0.0)
+    very_high_total_share = float(profile.get("very_high_total_share") or 0.0)
+    blowout_share = float(profile.get("blowout_share") or 0.0)
     sample_half_life = max(float(params.get("stage_sample_half_life", 36.0) or 36.0), 1.0)
     confidence = sample_size / (sample_size + sample_half_life) if sample_size else 0.0
     data_multiplier = 1.0
@@ -776,6 +802,16 @@ def stage_goal_context(
     if multiplier < 1.0:
         multiplier = min(1.0, multiplier + open_multiplier_offset)
     multiplier = clamp(multiplier, 0.78, 1.16)
+    tail_pressure = 0.0
+    if sample_size:
+        tail_pressure = (
+            0.85 * (high_total_share - 0.24)
+            + 0.85 * (very_high_total_share - 0.13)
+            + 0.55 * (blowout_share - 0.12)
+        )
+        tail_pressure = clamp(tail_pressure, -0.12, 0.30) * confidence
+    score_tail_boost = max(0.0, tail_pressure) * (0.65 + 0.35 * data_weight)
+    score_tail_dampener = max(0.0, -tail_pressure) * (0.65 + 0.35 * data_weight)
     notes = []
     if avg_total_goals is None:
         notes.append("No completed same-stage sample; stage multiplier stays neutral.")
@@ -783,6 +819,13 @@ def stage_goal_context(
         notes.append(
             f"Same-stage completed sample {sample_size}, avg total goals {avg_total_goals:.2f}, confidence {confidence:.2f}."
         )
+        if score_tail_boost > 0.025:
+            notes.append(
+                f"Same-stage tail is elevated: {high_total_share:.0%} 4+ goal games, "
+                f"{very_high_total_share:.0%} 5+ goal games, {blowout_share:.0%} 3+ margin games."
+            )
+        elif score_tail_dampener > 0.025:
+            notes.append("Same-stage sample is suppressing high-score tails.")
     if open_match_offset > 0.03 and multiplier < 1.0:
         notes.append("Current matchup openness offsets part of the conservative stage prior.")
     return {
@@ -792,6 +835,11 @@ def stage_goal_context(
         "multiplier": multiplier,
         "sample_size": sample_size,
         "avg_total_goals": avg_total_goals,
+        "high_total_share": high_total_share,
+        "very_high_total_share": very_high_total_share,
+        "blowout_share": blowout_share,
+        "score_tail_boost": score_tail_boost,
+        "score_tail_dampener": score_tail_dampener,
         "confidence": confidence,
         "open_match_offset": open_match_offset,
         "notes": notes,
@@ -927,8 +975,8 @@ def calibrate_score_distribution(rows: list[dict], target_wdl: dict[str, float],
     draw_probability = float(target_wdl["draw"])
     favorite_tilt = float(params.get("favorite_score_tilt", 0.0) or 0.0)
     draw_tilt = float(params.get("draw_score_tilt", 0.0) or 0.0)
-    high_total_boost = clamp(float(params.get("high_total_score_boost", 0.14) or 0.0), 0.0, 0.35)
-    very_high_total_boost = clamp(float(params.get("very_high_total_score_boost", 0.10) or 0.0), 0.0, 0.30)
+    high_total_boost = clamp(float(params.get("high_total_score_boost", 0.14) or 0.0), 0.0, 0.60)
+    very_high_total_boost = clamp(float(params.get("very_high_total_score_boost", 0.10) or 0.0), 0.0, 0.55)
     nil_nil_dampener = clamp(float(params.get("nil_nil_dampener", 0.15) or 0.0), 0.0, 0.40)
     one_goal_win_dampener = clamp(float(params.get("one_goal_win_dampener", 0.04) or 0.0), 0.0, 0.20)
     open_draw_boost = clamp(float(params.get("open_draw_score_boost", 0.10) or 0.0), 0.0, 0.30)
@@ -1092,27 +1140,62 @@ def predict(
         stage_context = stage_goal_context(conn, stage, params, openness["total_delta"])
         stage_multiplier = stage_context["multiplier"]
         stage_kind = stage_context["family"]
+        runtime_params = params.copy()
+        stage_tail_boost = float(stage_context.get("score_tail_boost") or 0.0)
+        stage_tail_dampener = float(stage_context.get("score_tail_dampener") or 0.0)
+        if stage_tail_boost > 0:
+            runtime_params["high_total_score_boost"] = clamp(
+                float(runtime_params.get("high_total_score_boost", 0.0) or 0.0) + stage_tail_boost,
+                0.0,
+                0.60,
+            )
+            runtime_params["very_high_total_score_boost"] = clamp(
+                float(runtime_params.get("very_high_total_score_boost", 0.0) or 0.0) + 1.15 * stage_tail_boost,
+                0.0,
+                0.55,
+            )
+            runtime_params["nil_nil_dampener"] = clamp(
+                float(runtime_params.get("nil_nil_dampener", 0.0) or 0.0) + 0.35 * stage_tail_boost,
+                0.0,
+                0.45,
+            )
+            runtime_params["one_goal_win_dampener"] = clamp(
+                float(runtime_params.get("one_goal_win_dampener", 0.0) or 0.0) + 0.20 * stage_tail_boost,
+                0.0,
+                0.22,
+            )
+        elif stage_tail_dampener > 0:
+            runtime_params["high_total_score_boost"] = clamp(
+                float(runtime_params.get("high_total_score_boost", 0.0) or 0.0) - 0.55 * stage_tail_dampener,
+                0.0,
+                0.60,
+            )
+            runtime_params["very_high_total_score_boost"] = clamp(
+                float(runtime_params.get("very_high_total_score_boost", 0.0) or 0.0) - 0.65 * stage_tail_dampener,
+                0.0,
+                0.55,
+            )
         lambda_a_base = (
-            base_goals
-            + params["attack_weight"] * attack_edge_a
-            + params["overall_weight"] * overall_edge_a
-            - params["keeper_weight"] * keeper_edge_b
-            + params["set_piece_weight"] * set_piece_edge_a
-            + params["fitness_weight"] * fitness_edge_a
-            + params["style_weight"] * style_delta_a
+            runtime_params["base_goals"]
+            + runtime_params["attack_weight"] * attack_edge_a
+            + runtime_params["overall_weight"] * overall_edge_a
+            - runtime_params["keeper_weight"] * keeper_edge_b
+            + runtime_params["set_piece_weight"] * set_piece_edge_a
+            + runtime_params["fitness_weight"] * fitness_edge_a
+            + runtime_params["style_weight"] * style_delta_a
             + manual_a
             + tactic_a
             + formation_a_delta
             + home_a
         )
         lambda_b_base = (
-            base_goals
-            + params["attack_weight"] * attack_edge_b
-            + params["overall_weight"] * overall_edge_b
-            - params["keeper_weight"] * keeper_edge_a
-            + params["set_piece_weight"] * set_piece_edge_b
-            + params["fitness_weight"] * fitness_edge_b
-            + params["style_weight"] * style_delta_b
+            runtime_params["base_goals"]
+            + runtime_params["attack_weight"] * attack_edge_b
+            + runtime_params["overall_weight"] * overall_edge_b
+            - runtime_params["keeper_weight"] * keeper_edge_a
+            + runtime_params["set_piece_weight"] * set_piece_edge_b
+            + runtime_params["fitness_weight"] * fitness_edge_b
+            + runtime_params["style_weight"] * style_delta_b
             + manual_b
             + tactic_b
             + formation_b_delta
@@ -1141,8 +1224,8 @@ def predict(
         lambda_a = clamp(lambda_a, 0.2, 3.8)
         lambda_b = clamp(lambda_b, 0.2, 3.8)
 
-        rho = float(params.get("dixon_coles_rho", 0.0) or 0.0)
-        zi = float(params.get("zero_inflation", 0.0) or 0.0)
+        rho = float(runtime_params.get("dixon_coles_rho", 0.0) or 0.0)
+        zi = float(runtime_params.get("zero_inflation", 0.0) or 0.0)
         base_rows = raw_score_grid(lambda_a, lambda_b, dixon_coles_rho=rho, zero_inflation=zi)
         raw_wdl = aggregate_wdl(base_rows)
         prior_wdl = strength_wdl_prior(
@@ -1164,7 +1247,7 @@ def predict(
             stage_kind,
             stage_context,
         )
-        prior_weight = clamp(float(params.get("wdl_prior_weight", 0.65) or 0.65), 0.0, 1.0)
+        prior_weight = clamp(float(runtime_params.get("wdl_prior_weight", 0.65) or 0.65), 0.0, 1.0)
         target_wdl = {
             key: prior_weight * prior_wdl[key] + (1.0 - prior_weight) * raw_wdl[key]
             for key in ("team_a_win", "draw", "team_b_win")
@@ -1172,7 +1255,7 @@ def predict(
         formation_confidence = 0.0
         if formation_stats:
             max_formation_weight = clamp(
-                float(params.get("formation_wdl_prior_max_weight", 0.35) or 0.35),
+                float(runtime_params.get("formation_wdl_prior_max_weight", 0.35) or 0.35),
                 0.0,
                 0.65,
             )
@@ -1188,7 +1271,12 @@ def predict(
             total_target = sum(target_wdl.values())
             if total_target > 0:
                 target_wdl = {key: value / total_target for key, value in target_wdl.items()}
-        p_a, p_draw, p_b, top_scores, score_calibration = score_distribution(lambda_a, lambda_b, target_wdl, params)
+        p_a, p_draw, p_b, top_scores, score_calibration = score_distribution(
+            lambda_a,
+            lambda_b,
+            target_wdl,
+            runtime_params,
+        )
 
         prediction_id = f"pred-{team_a_id.lower()}-{team_b_id.lower()}-{now_utc().replace(':', '').replace('+', '')}"
         result = {
@@ -1222,6 +1310,11 @@ def predict(
                         if stage_context["avg_total_goals"] is not None
                         else None
                     ),
+                    "high_total_share": round(stage_context["high_total_share"], 3),
+                    "very_high_total_share": round(stage_context["very_high_total_share"], 3),
+                    "blowout_share": round(stage_context["blowout_share"], 3),
+                    "score_tail_boost": round(stage_context["score_tail_boost"], 3),
+                    "score_tail_dampener": round(stage_context["score_tail_dampener"], 3),
                     "confidence": round(stage_context["confidence"], 3),
                     "open_match_offset": round(stage_context["open_match_offset"], 3),
                     "notes": stage_context["notes"],
@@ -1242,9 +1335,13 @@ def predict(
                 },
                 "prior_weight": prior_weight,
                 "formation_prior_weight": round(formation_confidence, 4),
-                "weight": params["wdl_score_calibration_weight"],
-                "favorite_tilt": params["favorite_score_tilt"],
-                "draw_tilt": params["draw_score_tilt"],
+                "weight": runtime_params["wdl_score_calibration_weight"],
+                "favorite_tilt": runtime_params["favorite_score_tilt"],
+                "draw_tilt": runtime_params["draw_score_tilt"],
+                "high_total_score_boost": runtime_params["high_total_score_boost"],
+                "very_high_total_score_boost": runtime_params["very_high_total_score_boost"],
+                "nil_nil_dampener": runtime_params["nil_nil_dampener"],
+                "one_goal_win_dampener": runtime_params["one_goal_win_dampener"],
             },
             "strength": {
                 team_a_id: {
@@ -1348,7 +1445,8 @@ def predict(
                 team_a_id: data_readiness(conn, team_a_id),
                 team_b_id: data_readiness(conn, team_b_id),
             },
-            "model_parameters": params,
+            "model_parameters": runtime_params,
+            "base_model_parameters": params,
             "model_version": MODEL_VERSION,
             "data_cutoff": today_utc(),
         }
