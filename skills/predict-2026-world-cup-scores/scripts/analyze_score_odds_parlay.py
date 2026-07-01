@@ -644,9 +644,9 @@ def score_group_for_recommendation(match: dict, favorite_group: str, raw_top_gro
 
     if (
         raw_top_group == "draw"
-        and favorite_probability < 0.48
+        and favorite_probability <= 0.50
         and favorite_edge < 0.17
-        and raw_group_probability >= 0.24
+        and raw_group_probability >= 0.22
         and (
             market_draw_probability >= 0.30
             or (lambda_total <= 2.65 and total_delta <= 0.12)
@@ -1004,6 +1004,12 @@ def relationship_context(match: dict) -> dict:
         and draw_probability >= 0.27
         and favorite_edge_to_draw <= 0.12
     )
+    low_confidence_draw_risk = (
+        favorite_group != "draw"
+        and favorite_probability <= 0.50
+        and draw_probability >= 0.22
+        and favorite_edge_to_draw <= 0.28
+    )
 
     if favorite_group == "draw":
         return {
@@ -1025,7 +1031,7 @@ def relationship_context(match: dict) -> dict:
             "probability_first_group": "draw",
             "note": "首选比分落在平局，稳健组按防平处理。",
         }
-    if close_draw:
+    if close_draw or low_confidence_draw_risk:
         return {
             "label": f"{outcome_label(favorite_group)}防平",
             "primary_group": favorite_group,
@@ -1033,7 +1039,7 @@ def relationship_context(match: dict) -> dict:
             "probability": favorite_probability,
             "probability_text": f"{format_pct(favorite_probability)} / 平{format_pct(draw_probability)}",
             "probability_first_group": favorite_group,
-            "note": "平局概率接近头名，需要防平。",
+            "note": "热门置信度不足，平局风险需要保留。",
         }
     return {
         "label": outcome_label(favorite_group),
@@ -1722,6 +1728,11 @@ def main() -> None:
     )
     for group in parlay_groups.values():
         enrich_parlays(group, args.stake)
+    selected_parlays = (
+        parlay_groups["probability_first"]
+        + parlay_groups["odds_first"]
+        + parlay_groups["expected_value_first"]
+    )
     result = {
         "odds_path": str(odds_path),
         "market_weight": args.market_weight,
@@ -1739,7 +1750,7 @@ def main() -> None:
         "analysis_date": analysis_date,
         "stage": args.stage,
         "matches": matches,
-        "parlays": parlays,
+        "parlays": selected_parlays,
         "parlay_groups": parlay_groups,
     }
     if args.format == "json":

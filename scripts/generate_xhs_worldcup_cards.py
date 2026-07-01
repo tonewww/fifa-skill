@@ -281,6 +281,26 @@ def recommended_probability(match: dict) -> float:
     return float(top_scores(match)[0].get("blended_probability") or 0.0)
 
 
+def score_pick_rows(match: dict, limit: int = 3) -> list[dict]:
+    return top_scores(match, limit=limit)
+
+
+def score_pick_text(match: dict) -> str:
+    return " / ".join(f"{row['score']}({pct(float(row.get('blended_probability') or 0.0))})" for row in score_pick_rows(match))
+
+
+def score_top3_explanation(match: dict) -> str:
+    rows = score_pick_rows(match)
+    groups = {row.get("group") for row in rows}
+    rel = relationship_context(match)
+    label = rel.get("label", "")
+    if len(groups) == 1:
+        return f"说明：Top3集中在{outcome_label(next(iter(groups)))}方向，和{label}口径接近。"
+    if "draw" in groups:
+        return f"说明：Top3含平局比分，低比分与防平风险仍需保留。"
+    return "说明：Top3按混合概率排序，展示主要比分分布。"
+
+
 def score_explanation(match: dict) -> str:
     recommendation = match.get("recommended_score") or {}
     favorite_group = recommendation.get("favorite_group")
@@ -311,29 +331,37 @@ def score_explanation(match: dict) -> str:
 
 def card_scores(data: dict, date_slug: str) -> Path:
     num_matches = len(data["matches"])
-    height = max(1440, 228 + num_matches * 280 + 100)
+    height = max(1440, 228 + num_matches * 306 + 100)
     image, draw = base_card("AI比分预估", "世界杯 2026 比分预测", "02", height=height)
     
     y_start = 228
     panels = []
     for _ in range(num_matches):
-        panels.append((170, y_start, 1020, y_start + 234))
-        y_start += 280
+        panels.append((170, y_start, 1020, y_start + 260))
+        y_start += 306
         
     for match, box in zip(data["matches"], panels):
         x1, y1, x2, y2 = box
         rounded(draw, box, COLORS["panel"], COLORS["line"], radius=8)
-        score = recommended_scores_text(match)
         draw_text(draw, (x1 + 26, y1 + 25), match["match"], fit_text(draw, match["match"], x2 - x1 - 360, 34), COLORS["ink"])
-        pill(draw, x2 - 182, y1 + 24, "首选比分", COLORS["soft_red"], COLORS["red"], size=20, pad_x=16, pad_y=8)
+        pill(draw, x2 - 210, y1 + 24, "比分 Top3", COLORS["soft_red"], COLORS["red"], size=20, pad_x=16, pad_y=8)
         draw.line((x1 + 26, y1 + 74, x2 - 26, y1 + 74), fill=COLORS["line"], width=1)
 
-        draw_text(draw, (x1 + 68, y1 + 110), "预估", FONTS["small"], COLORS["muted"])
-        draw_text(draw, (x1 + 66, y1 + 140), score, fit_text(draw, score, 240, 78, 42), COLORS["red"])
-        draw.line((x1 + 330, y1 + 125, x2 - 60, y1 + 125), fill=COLORS["line"], width=2)
-        draw_text(draw, (x1 + 330, y1 + 143), f"概率 {pct(recommended_probability(match))}", FONTS["small"], COLORS["green"])
-        for line_index, line in enumerate(wrap_text(draw, score_explanation(match), x2 - x1 - 390, FONTS["tiny"], 2)):
-            draw_text(draw, (x1 + 330, y1 + 176 + line_index * 26), line, FONTS["tiny"], COLORS["muted"])
+        rows = score_pick_rows(match)
+        col_w = (x2 - x1 - 86) // 3
+        for index, row in enumerate(rows):
+            rx = x1 + 26 + index * col_w
+            score = str(row.get("score") or "")
+            probability = pct(float(row.get("blended_probability") or 0.0))
+            label = "Top 1" if index == 0 else f"Top {index + 1}"
+            draw_text(draw, (rx, y1 + 104), label, FONTS["tiny"], COLORS["muted"])
+            draw_text(draw, (rx, y1 + 134), score, fit_text(draw, score, col_w - 28, 58, 36), COLORS["red"] if index == 0 else COLORS["ink"])
+            draw_text(draw, (rx, y1 + 190), f"概率 {probability}", FONTS["small"], COLORS["green"] if index == 0 else COLORS["muted"])
+            if index < 2:
+                sx = rx + col_w - 18
+                draw.line((sx, y1 + 108, sx, y1 + 210), fill=COLORS["line"], width=1)
+        for line_index, line in enumerate(wrap_text(draw, score_top3_explanation(match), x2 - x1 - 72, FONTS["tiny"], 1)):
+            draw_text(draw, (x1 + 26, y1 + 224 + line_index * 24), line, FONTS["tiny"], COLORS["muted"])
     draw_text(draw, (170, height - 80), "说明：AI 模型计算结果，不构成建议。", FONTS["small"], COLORS["muted"])
     out = OUT_DIR / f"{date_slug}-02-score-pick.png"
     image.save(out, quality=95)
@@ -453,8 +481,8 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
     score_lines = []
     for match in data["matches"]:
         score_lines.append(
-            f"- {match['match']}：{recommended_scores_text(match)}，概率 {pct(recommended_probability(match))}。"
-            f"{score_explanation(match).replace('说明：', '')}"
+            f"- {match['match']}：{score_pick_text(match)}。"
+            f"{score_top3_explanation(match).replace('说明：', '')}"
         )
 
     parlay_lines = []
@@ -478,7 +506,7 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
 胜负倾向：
 {chr(10).join(matches)}
 
-比分首选：
+比分 Top3：
 {chr(10).join(score_lines)}
 
 {parlay_name}分三组：

@@ -106,6 +106,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/ingest_fox_boxscores.py --d
 ```
 
    - If a day has already been verified from FIFA/media match reports, store those final scores in a local results JSON and ingest that instead of re-parsing a fragile live page.
+   - For knockout matches decided by penalties, store the football score after extra time in `home_score` / `away_score`; keep penalty scores and the advancing team in optional JSON fields and in `notes`. Treat the model training WDL as a draw for that match, while using the advancement note for bracket context.
 
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/ingest_results_json.py --db data/worldcup2026.sqlite --date 2026-06-26 --results-json data/results/2026-06-26.json
@@ -127,6 +128,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/review_completed_matches.py
    - Publishing rule after the 2026-06-26 review: keep the headline score aligned with the blended WDL favorite by default, but preserve an original draw top score when the WDL favorite is weak, the favorite edge is small, and the draw/low-score market structure is strong. Do not force a 2-1 or 1-2 recommendation just to match a low-confidence WDL favorite.
    - Publishing rule after the 2026-06-27 review: do not collapse WDL relationships into only win/loss labels. If draw is the highest probability, publish `平局优先`; if draw is close to a weak favorite or the protected headline score is a draw, publish `主胜防平` / `客胜防平` and allow the probability-first parlay block to use draw scorelines. When favorites win by high margins that were outside Top 8, inspect openness, strength mismatch, and group-stage goal-difference pressure before suppressing 3+ goal tails.
    - Publishing/model rule after the 2026-06-28 review: the score model must not force every group-stage favorite into 1-0/2-1/0-1 shapes. Use same-stage completed results to adapt the score-tail shape: elevated 4+ goal, 5+ goal, and 3+ margin frequencies should increase high-total and very-high-total score mass, while conservative stages can dampen it. Keep lambda stage multipliers adaptive rather than hard-capped; apply high-score evidence mainly to distribution shape and headline-score selection. In the publishing layer, if team-strength edge, tactical openness, group incentive, and exact-score market tail all point to a wider win, allow 3-0/3-1/4-1 style recommendations inside the WDL-favored outcome.
+   - Publishing/model rule after the 2026-07-01 review: WDL direction can be correct while the score tail is still too narrow. If the favorite is above roughly 52%, exact-score market prices 3-0/3-1 close to the normal favorite scores, and the underdog clean-sheet/low-xG profile is weak, keep a 3-0 or 3-1 tail candidate inside the displayed Top 8/Top 3 pool instead of letting 1-1/2-2 draw shapes crowd out every wider favorite win. This is a publishing/distribution-shape correction, not a reason to inflate all favorites.
 
 8. Add group standing and qualification incentive context before predicting group-stage slates.
    - Ingest the latest completed match results before analyzing the next odds JSON.
