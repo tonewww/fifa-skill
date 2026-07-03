@@ -570,7 +570,7 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
             "target_total": target_total,
             "minimum_total": 3,
             "minimum_winner_goals": 3,
-            "minimum_probability_ratio": 0.48 if high_tail_environment else 0.56,
+            "minimum_probability_ratio": 0.78 if high_tail_environment else 0.84,
             "short_note": f"{outcome_label(favorite_group)}优势与大比分尾部同时存在，向3球以上胜比分扩展。",
         }
 
@@ -586,7 +586,7 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
             "target_total": max(3.0, min(4.6, target_seed + 0.25)),
             "minimum_total": 3,
             "minimum_winner_goals": 2,
-            "minimum_probability_ratio": 0.60,
+            "minimum_probability_ratio": 0.76,
             "short_note": f"小组赛高比分尾部升温，{outcome_label(favorite_group)}方向保留更高比分。",
         }
 
@@ -1206,6 +1206,7 @@ def parlay_pool(
     max_clear_favorite_deviations: int | None,
     odds_power: float,
     restrict_all_favorites: bool = False,
+    leg_limit: int = 14,
 ) -> list[dict]:
     leg_sets = []
     favorite_context = []
@@ -1250,7 +1251,7 @@ def parlay_pool(
                     reverse=True,
                 )
                 eligible = favorite_eligible
-        leg_sets.append(eligible[:14])
+        leg_sets.append(eligible[:leg_limit])
     if any(not legs for legs in leg_sets):
         return []
 
@@ -1304,7 +1305,8 @@ def fill_probability_first(
             True,
             0,
             odds_power,
-            True,
+            restrict_all_favorites=True,
+            leg_limit=14,
         )
         enrich_parlays(pool, 1.0)
         pool = [parlay for parlay in pool if parlay_signature(parlay) not in seen]
@@ -1324,6 +1326,28 @@ def enrich_parlays(parlays: list[dict], stake: float) -> list[dict]:
     for parlay in parlays:
         parlay.update(expected_value_fields(parlay["blended_probability"], parlay["combined_odds"], stake))
     return parlays
+
+
+def select_positive_ev_first(
+    pool: list[dict],
+    per_group: int,
+    sort_key,
+) -> list[dict]:
+    """Prefer positive expected net profit, then backfill with best remaining rows."""
+    selected = []
+    seen = set()
+    positive_pool = [parlay for parlay in pool if parlay["expected_profit"] > 0]
+    positive_pool.sort(key=sort_key, reverse=True)
+    full_pool = sorted(pool, key=sort_key, reverse=True)
+    for parlay in positive_pool + full_pool:
+        signature = parlay_signature(parlay)
+        if signature in seen:
+            continue
+        selected.append(parlay)
+        seen.add(signature)
+        if len(selected) >= per_group:
+            break
+    return selected
 
 
 def split_parlays(
@@ -1350,7 +1374,8 @@ def split_parlays(
         True,
         0,
         odds_power,
-        True,
+        restrict_all_favorites=True,
+        leg_limit=14,
     )
     enrich_parlays(probability_pool, 1.0)
     probability_pool.sort(
@@ -1377,14 +1402,16 @@ def split_parlays(
         False,
         odds_max_clear_favorite_deviations,
         odds_power,
+        restrict_all_favorites=False,
+        leg_limit=24,
     )
     enrich_parlays(odds_pool, 1.0)
     odds_pool = [parlay for parlay in odds_pool if parlay_signature(parlay) not in seen]
-    odds_pool.sort(
-        key=lambda row: (row["combined_odds"], row["balance_score"], row["blended_probability"]),
-        reverse=True,
+    odds_first = select_positive_ev_first(
+        odds_pool,
+        per_group,
+        lambda row: (row["combined_odds"], row["expected_profit"], row["blended_probability"]),
     )
-    odds_first = odds_pool[:per_group]
 
     seen.update(parlay_signature(parlay) for parlay in odds_first)
     ev_pool = parlay_pool(
@@ -1396,17 +1423,20 @@ def split_parlays(
         False,
         ev_max_clear_favorite_deviations,
         odds_power,
+        restrict_all_favorites=False,
+        leg_limit=31,
     )
     enrich_parlays(ev_pool, 1.0)
     ev_pool = [parlay for parlay in ev_pool if parlay_signature(parlay) not in seen]
-    ev_pool.sort(
-        key=lambda row: (row["expected_profit"], row["roi"], row["balance_score"], row["blended_probability"]),
-        reverse=True,
+    expected_value_first = select_positive_ev_first(
+        ev_pool,
+        per_group,
+        lambda row: (row["expected_profit"], row["roi"], row["balance_score"], row["blended_probability"]),
     )
     return {
         "probability_first": probability_first,
         "odds_first": odds_first,
-        "expected_value_first": ev_pool[:per_group],
+        "expected_value_first": expected_value_first,
     }
 
 
@@ -1657,10 +1687,10 @@ def main() -> None:
     )
     parser.add_argument("--probability-first-min-leg-probability", type=float, default=0.07)
     parser.add_argument("--probability-first-min-leg-value", type=float, default=0.45)
-    parser.add_argument("--odds-first-min-leg-probability", type=float, default=0.04)
-    parser.add_argument("--odds-first-min-leg-value", type=float, default=0.45)
-    parser.add_argument("--ev-first-min-leg-probability", type=float, default=0.04)
-    parser.add_argument("--ev-first-min-leg-value", type=float, default=0.45)
+    parser.add_argument("--odds-first-min-leg-probability", type=float, default=0.01)
+    parser.add_argument("--odds-first-min-leg-value", type=float, default=0.75)
+    parser.add_argument("--ev-first-min-leg-probability", type=float, default=0.001)
+    parser.add_argument("--ev-first-min-leg-value", type=float, default=0.80)
     parser.add_argument(
         "--odds-first-max-clear-favorite-deviations",
         type=int,
