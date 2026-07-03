@@ -68,7 +68,7 @@ def fetch(url: str, timeout: int) -> tuple[bytes, dict[str, str], str]:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "CodexWorldCupSkill/0.1 (+local research; contact user)",
+            "User-Agent": "WorldCupSkill/0.1 (+local research; contact user)",
             "Accept": "*/*",
         },
     )

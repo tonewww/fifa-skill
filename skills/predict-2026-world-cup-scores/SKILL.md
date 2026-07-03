@@ -1,6 +1,6 @@
 ---
 name: predict-2026-world-cup-scores
-description: Build, refresh, audit, and use a 2026 FIFA World Cup team/player database and probabilistic score prediction model. Use when Codex needs to collect or update 2026 World Cup teams, squads, fixtures, player profiles, injuries, historical results, ratings, style matchups, strength tables, win/draw/loss probabilities, likely scorelines, or matchup-specific analysis between two national teams.
+description: Build, refresh, audit, and use a 2026 FIFA World Cup team/player database and probabilistic score prediction model. Use when  needs to collect or update 2026 World Cup teams, squads, fixtures, player profiles, injuries, historical results, ratings, style matchups, strength tables, win/draw/loss probabilities, likely scorelines, or matchup-specific analysis between two national teams.
 ---
 
 # Predict 2026 World Cup Scores

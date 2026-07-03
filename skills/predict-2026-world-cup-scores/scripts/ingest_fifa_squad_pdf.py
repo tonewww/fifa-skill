@@ -15,7 +15,7 @@ from common import TABLE_COLUMNS, clamp, coerce_value, connect, now_utc, slugify
 try:
     import pdfplumber
 except ImportError as exc:  # pragma: no cover - environment guard
-    raise SystemExit("pdfplumber is required. Use the bundled Codex Python runtime or install pdfplumber.") from exc
+    raise SystemExit("pdfplumber is required. Use the bundled  Python runtime or install pdfplumber.") from exc
 
 
 HOST_CODES = {"CAN", "MEX", "USA"}
