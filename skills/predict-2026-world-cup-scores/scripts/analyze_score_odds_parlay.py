@@ -67,6 +67,12 @@ DEFAULT_TEAM_MAP = {
 }
 
 
+PARLAY_ODDS_CAPS = {
+    3: 100000.0,
+    4: 250000.0,
+}
+
+
 def score_distribution(result: dict, max_goals: int = 10) -> dict[str, float]:
     params = result.get("model_parameters") or {}
     target_wdl = (result.get("score_calibration") or {}).get("target_wdl")
@@ -430,6 +436,16 @@ def expected_value_fields(probability: float, odds: float, stake: float) -> dict
     }
 
 
+def parlay_odds_cap(leg_count: int) -> float | None:
+    return PARLAY_ODDS_CAPS.get(leg_count)
+
+
+def parlay_effective_odds(parlay: dict) -> float:
+    combined_odds = float(parlay["combined_odds"])
+    cap = parlay_odds_cap(len(parlay.get("legs") or []))
+    return min(combined_odds, cap) if cap is not None else combined_odds
+
+
 def score_group(score: str) -> str | None:
     try:
         home_goals, away_goals = [int(part) for part in score.split(":", 1)]
@@ -643,6 +659,14 @@ def score_group_for_recommendation(match: dict, favorite_group: str, raw_top_gro
     market_draw_probability = float(market_wdl.get("draw") or 0.0)
 
     if (
+        raw_top_group
+        and favorite_probability <= 0.41
+        and favorite_edge <= 0.04
+        and raw_group_probability >= 0.20
+    ):
+        return raw_top_group, "ultra_balanced_raw_top"
+
+    if (
         raw_top_group == "draw"
         and favorite_probability <= 0.50
         and favorite_edge < 0.17
@@ -761,6 +785,12 @@ def recommendation_analysis_note(
                 f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
                 "但热门优势不足且平局赔率/低比分结构较强；"
                 "因此保留平局方向的原始高概率比分，避免机械改写成小胜。"
+            )
+        if selection_reason == "ultra_balanced_raw_top":
+            return (
+                f"胜负倾向为{favorite_label}（{format_pct(favorite_probability)}），"
+                "但三项概率高度接近，热门标签不稳定；"
+                f"因此保留原始最高的{outcome_label(recommended_group)}比分，避免弱热门锚定。"
             )
         if selection_reason == "balanced_open_draw":
             return (
@@ -978,6 +1008,54 @@ def candidate_balance_score(candidate: dict, odds_power: float) -> float:
     return candidate["blended_probability"] * (candidate["odds"] ** odds_power)
 
 
+def select_diverse_leg_candidates(eligible: list[dict], leg_limit: int, odds_power: float) -> list[dict]:
+    if len(eligible) <= leg_limit:
+        return eligible
+    selected = []
+    seen = set()
+
+    def add_from(rows: list[dict], quota: int) -> None:
+        added = 0
+        for row in rows:
+            key = (row["match"], row["score"])
+            if key in seen:
+                continue
+            selected.append(row)
+            seen.add(key)
+            added += 1
+            if len(selected) >= leg_limit or added >= quota:
+                break
+
+    probability_rows = sorted(
+        eligible,
+        key=lambda row: (row["blended_probability"], row["value_proxy"], row["odds"]),
+        reverse=True,
+    )
+    value_rows = sorted(
+        eligible,
+        key=lambda row: (row["value_proxy"], row["blended_probability"], row["odds"]),
+        reverse=True,
+    )
+    balance_rows = sorted(
+        eligible,
+        key=lambda row: (candidate_balance_score(row, odds_power), row["blended_probability"], row["odds"]),
+        reverse=True,
+    )
+    odds_rows = sorted(
+        eligible,
+        key=lambda row: (row["odds"], row["blended_probability"], row["value_proxy"]),
+        reverse=True,
+    )
+
+    add_from(probability_rows, max(3, leg_limit // 3))
+    add_from(eligible, max(4, leg_limit // 2))
+    add_from(value_rows, max(3, leg_limit // 3))
+    add_from(balance_rows, max(3, leg_limit // 3))
+    add_from(odds_rows, max(2, leg_limit // 5))
+    add_from(probability_rows + value_rows + balance_rows + eligible + odds_rows, leg_limit)
+    return selected[:leg_limit]
+
+
 def match_favorite_group(match: dict) -> tuple[str, float]:
     favorite_group, favorite_probability = max(
         match["blended_wdl"].items(),
@@ -990,6 +1068,12 @@ def relationship_context(match: dict) -> dict:
     wdl = match.get("blended_wdl") or {}
     favorite_group, favorite_probability = match_favorite_group(match)
     draw_probability = float(wdl.get("draw") or 0.0)
+    stage = str((match.get("prediction") or {}).get("stage") or "")
+    stage_lower = stage.lower()
+    is_knockout = any(
+        token in stage_lower
+        for token in ("round", "knockout", "quarter", "semi", "final")
+    )
     recommendation = match.get("recommended_score") or {}
     recommended_group = recommendation.get("group")
     selection_reason = recommendation.get("selection_reason")
@@ -998,6 +1082,11 @@ def relationship_context(match: dict) -> dict:
         favorite_group != "draw"
         and recommended_group == "draw"
         and selection_reason == "weak_favorite_draw_protection"
+    )
+    ultra_balanced_protected = (
+        favorite_group != "draw"
+        and recommended_group != favorite_group
+        and selection_reason == "ultra_balanced_raw_top"
     )
     close_draw = (
         favorite_group != "draw"
@@ -1010,6 +1099,12 @@ def relationship_context(match: dict) -> dict:
         and draw_probability >= 0.22
         and favorite_edge_to_draw <= 0.28
     )
+    knockout_regulation_draw_risk = (
+        favorite_group != "draw"
+        and is_knockout
+        and favorite_probability <= 0.68
+        and draw_probability >= 0.16
+    )
 
     if favorite_group == "draw":
         return {
@@ -1021,15 +1116,25 @@ def relationship_context(match: dict) -> dict:
             "probability_first_group": "draw",
             "note": "平局是最高概率结果。",
         }
-    if draw_protected:
+    if draw_protected or ultra_balanced_protected:
+        secondary_group = recommended_group if recommended_group else "draw"
+        secondary_probability = float(wdl.get(secondary_group) or draw_probability)
+        secondary_prefix = "平" if secondary_group == "draw" else outcome_label(secondary_group)
         return {
-            "label": f"{outcome_label(favorite_group)}防平",
+            "label": (
+                f"{outcome_label(favorite_group)}防平"
+                if secondary_group == "draw"
+                else f"{outcome_label(favorite_group)}防冷"
+            ),
             "primary_group": favorite_group,
-            "secondary_group": "draw",
+            "secondary_group": secondary_group,
             "probability": favorite_probability,
-            "probability_text": f"{format_pct(favorite_probability)} / 平{format_pct(draw_probability)}",
-            "probability_first_group": "draw",
-            "note": "首选比分落在平局，稳健组按防平处理。",
+            "probability_text": (
+                f"{format_pct(favorite_probability)} / "
+                f"{secondary_prefix}{format_pct(secondary_probability)}"
+            ),
+            "probability_first_group": recommended_group,
+            "note": "热门优势极弱，稳健组按原始最高比分方向处理。",
         }
     if close_draw or low_confidence_draw_risk:
         return {
@@ -1040,6 +1145,16 @@ def relationship_context(match: dict) -> dict:
             "probability_text": f"{format_pct(favorite_probability)} / 平{format_pct(draw_probability)}",
             "probability_first_group": favorite_group,
             "note": "热门置信度不足，平局风险需要保留。",
+        }
+    if knockout_regulation_draw_risk:
+        return {
+            "label": f"{outcome_label(favorite_group)}防平",
+            "primary_group": favorite_group,
+            "secondary_group": "draw",
+            "probability": favorite_probability,
+            "probability_text": f"{format_pct(favorite_probability)} / 平{format_pct(draw_probability)}",
+            "probability_first_group": favorite_group,
+            "note": "淘汰赛按90分钟口径，热门仍需保留常规时间平局风险。",
         }
     return {
         "label": outcome_label(favorite_group),
@@ -1154,7 +1269,7 @@ def build_parlays(
             restrict_clear_favorites,
             odds_power,
         )
-        leg_sets.append(eligible[:14])
+        leg_sets.append(select_diverse_leg_candidates(eligible, 14, odds_power))
     if any(not legs for legs in leg_sets):
         return []
     parlays = []
@@ -1251,7 +1366,7 @@ def parlay_pool(
                     reverse=True,
                 )
                 eligible = favorite_eligible
-        leg_sets.append(eligible[:leg_limit])
+        leg_sets.append(select_diverse_leg_candidates(eligible, leg_limit, odds_power))
     if any(not legs for legs in leg_sets):
         return []
 
@@ -1308,10 +1423,10 @@ def fill_probability_first(
             restrict_all_favorites=True,
             leg_limit=14,
         )
-        enrich_parlays(pool, 1.0)
+        enrich_parlays(pool, 1.0, odds_power)
         pool = [parlay for parlay in pool if parlay_signature(parlay) not in seen]
         pool.sort(
-            key=lambda row: (row["blended_probability"], row["balance_score"], row["value_proxy"]),
+            key=lambda row: (row["blended_probability"], row["settlement_balance_score"], row["settlement_value_proxy"]),
             reverse=True,
         )
         for parlay in pool:
@@ -1322,9 +1437,16 @@ def fill_probability_first(
     return selected
 
 
-def enrich_parlays(parlays: list[dict], stake: float) -> list[dict]:
+def enrich_parlays(parlays: list[dict], stake: float, odds_power: float = 0.35) -> list[dict]:
     for parlay in parlays:
-        parlay.update(expected_value_fields(parlay["blended_probability"], parlay["combined_odds"], stake))
+        effective_odds = parlay_effective_odds(parlay)
+        cap = parlay_odds_cap(len(parlay.get("legs") or []))
+        parlay["effective_odds"] = effective_odds
+        parlay["odds_cap"] = cap
+        parlay["odds_capped"] = cap is not None and float(parlay["combined_odds"]) > cap
+        parlay["settlement_value_proxy"] = parlay["blended_probability"] * effective_odds
+        parlay["settlement_balance_score"] = parlay["blended_probability"] * (effective_odds ** odds_power)
+        parlay.update(expected_value_fields(parlay["blended_probability"], effective_odds, stake))
     return parlays
 
 
@@ -1348,6 +1470,22 @@ def select_positive_ev_first(
         if len(selected) >= per_group:
             break
     return selected
+
+
+def cap_aware_odds_first_key(parlay: dict) -> tuple[float, float, float, float]:
+    effective_odds = float(parlay["effective_odds"])
+    cap = parlay.get("odds_cap")
+    if cap:
+        cap = float(cap)
+        odds_tier = 1.0 if effective_odds >= cap * 0.85 else effective_odds / cap
+    else:
+        odds_tier = effective_odds
+    return (
+        odds_tier,
+        parlay["expected_profit"],
+        parlay["settlement_value_proxy"],
+        parlay["blended_probability"],
+    )
 
 
 def split_parlays(
@@ -1377,9 +1515,9 @@ def split_parlays(
         restrict_all_favorites=True,
         leg_limit=14,
     )
-    enrich_parlays(probability_pool, 1.0)
+    enrich_parlays(probability_pool, 1.0, odds_power)
     probability_pool.sort(
-        key=lambda row: (row["blended_probability"], row["balance_score"], row["value_proxy"]),
+        key=lambda row: (row["blended_probability"], row["settlement_balance_score"], row["settlement_value_proxy"]),
         reverse=True,
     )
     probability_first = probability_pool[:per_group]
@@ -1405,12 +1543,12 @@ def split_parlays(
         restrict_all_favorites=False,
         leg_limit=24,
     )
-    enrich_parlays(odds_pool, 1.0)
+    enrich_parlays(odds_pool, 1.0, odds_power)
     odds_pool = [parlay for parlay in odds_pool if parlay_signature(parlay) not in seen]
     odds_first = select_positive_ev_first(
         odds_pool,
         per_group,
-        lambda row: (row["combined_odds"], row["expected_profit"], row["blended_probability"]),
+        cap_aware_odds_first_key,
     )
 
     seen.update(parlay_signature(parlay) for parlay in odds_first)
@@ -1426,12 +1564,12 @@ def split_parlays(
         restrict_all_favorites=False,
         leg_limit=31,
     )
-    enrich_parlays(ev_pool, 1.0)
+    enrich_parlays(ev_pool, 1.0, odds_power)
     ev_pool = [parlay for parlay in ev_pool if parlay_signature(parlay) not in seen]
     expected_value_first = select_positive_ev_first(
         ev_pool,
         per_group,
-        lambda row: (row["expected_profit"], row["roi"], row["balance_score"], row["blended_probability"]),
+        lambda row: (row["expected_profit"], row["roi"], row["settlement_balance_score"], row["blended_probability"]),
     )
     return {
         "probability_first": probability_first,
@@ -1452,6 +1590,12 @@ def format_money(value: float) -> str:
     if abs(value) >= 1:
         return f"{value:.3f}"
     return f"{value:.4f}"
+
+
+def format_odds(value: float) -> str:
+    if abs(value) >= 100000:
+        return f"{value:.0f}"
+    return f"{value:.2f}"
 
 
 def md_cell(value: object) -> str:
@@ -1538,11 +1682,15 @@ def recommended_score_probability(match: dict) -> float:
 
 def write_markdown(result: dict) -> str:
     label = parlay_label(result)
+    parlay_count = len(result["matches"])
+    cap = parlay_odds_cap(parlay_count)
+    cap_text = f"；{label} 单注结算赔率封顶 {format_odds(cap)} 倍" if cap is not None else ""
     lines = [
         f"数据口径：{result['odds_path']}；混合概率 = 模型 {format_pct(1 - result['market_weight'])} + 赔率隐含 {format_pct(result['market_weight'])}。",
         (
-            f"资金口径：每注 {format_money(result['stake'])} 单位；预期返还 = 概率 × 赔率 × 每注，"
-            "预期净收益 = 预期返还 - 每注，ROI = 概率 × 赔率 - 1。"
+            f"资金口径：每注 {format_money(result['stake'])} 单位{cap_text}；"
+            "单场预期返还 = 概率 × 赔率 × 每注；串关预期返还 = 概率 × 结算赔率 × 每注，"
+            "预期净收益 = 预期返还 - 每注，ROI = 概率 × 结算赔率 - 1。"
         ),
         f"说明：输出为概率和期望值分析，不是投注建议；精确比分 {label} 的单一命中率天然很低。",
         "",
@@ -1607,48 +1755,51 @@ def write_markdown(result: dict) -> str:
             "",
             "### 前 3 个：胜率优先，赔率其次",
             "",
-            "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 序号 | 串关比分 | 热门偏离 | 原始综合赔率 | 结算赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for index, parlay in enumerate(result["parlay_groups"]["probability_first"], start=1):
         lines.append(
-            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | {parlay['combined_odds']:.2f} | "
+            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | "
+            f"{format_odds(parlay['combined_odds'])} | {format_odds(parlay.get('effective_odds', parlay['combined_odds']))} | "
             f"{format_pct(parlay['blended_probability'])} | {format_money(parlay['return_if_hit'])} | "
             f"{format_money(parlay['expected_return'])} | {format_money(parlay['expected_profit'])} | "
-            f"{format_pct(parlay['roi'])} | {parlay['balance_score']:.6f} |"
+            f"{format_pct(parlay['roi'])} | {parlay.get('settlement_balance_score', parlay['balance_score']):.6f} |"
         )
     lines.extend(
         [
             "",
             "### 中 3 个：赔率优先，胜率保持中等门槛",
             "",
-            "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 序号 | 串关比分 | 热门偏离 | 原始综合赔率 | 结算赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for index, parlay in enumerate(result["parlay_groups"]["odds_first"], start=4):
         lines.append(
-            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | {parlay['combined_odds']:.2f} | "
+            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | "
+            f"{format_odds(parlay['combined_odds'])} | {format_odds(parlay.get('effective_odds', parlay['combined_odds']))} | "
             f"{format_pct(parlay['blended_probability'])} | {format_money(parlay['return_if_hit'])} | "
             f"{format_money(parlay['expected_return'])} | {format_money(parlay['expected_profit'])} | "
-            f"{format_pct(parlay['roi'])} | {parlay['balance_score']:.6f} |"
+            f"{format_pct(parlay['roi'])} | {parlay.get('settlement_balance_score', parlay['balance_score']):.6f} |"
         )
     lines.extend(
         [
             "",
             "### 期望收益最高 3 个：EV 优先，高方差",
             "",
-            "| 序号 | 串关比分 | 热门偏离 | 综合赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 序号 | 串关比分 | 热门偏离 | 原始综合赔率 | 结算赔率 | 估算命中率 | 命中返还 | 预期返还 | 预期净收益 | ROI | 平衡分 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for index, parlay in enumerate(result["parlay_groups"]["expected_value_first"], start=7):
         lines.append(
-            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | {parlay['combined_odds']:.2f} | "
+            f"| {index} | {md_cell(parlay_legs_text(parlay))} | {parlay.get('clear_favorite_deviations', 0)} | "
+            f"{format_odds(parlay['combined_odds'])} | {format_odds(parlay.get('effective_odds', parlay['combined_odds']))} | "
             f"{format_pct(parlay['blended_probability'])} | {format_money(parlay['return_if_hit'])} | "
             f"{format_money(parlay['expected_return'])} | {format_money(parlay['expected_profit'])} | "
-            f"{format_pct(parlay['roi'])} | {parlay['balance_score']:.6f} |"
+            f"{format_pct(parlay['roi'])} | {parlay.get('settlement_balance_score', parlay['balance_score']):.6f} |"
         )
     return "\n".join(lines)
 
@@ -1740,7 +1891,7 @@ def main() -> None:
         None,
         args.odds_power,
     )
-    enrich_parlays(parlays, args.stake)
+    enrich_parlays(parlays, args.stake, args.odds_power)
     parlay_groups = split_parlays(
         matches,
         args.probability_first_min_leg_probability,
@@ -1757,7 +1908,7 @@ def main() -> None:
         3,
     )
     for group in parlay_groups.values():
-        enrich_parlays(group, args.stake)
+        enrich_parlays(group, args.stake, args.odds_power)
     selected_parlays = (
         parlay_groups["probability_first"]
         + parlay_groups["odds_first"]
@@ -1779,6 +1930,8 @@ def main() -> None:
         "odds_power": args.odds_power,
         "analysis_date": analysis_date,
         "stage": args.stage,
+        "parlay_odds_cap": parlay_odds_cap(len(matches)),
+        "parlay_effective_odds_note": "3串1单注结算赔率封顶100000倍；4串1单注结算赔率封顶250000倍。",
         "matches": matches,
         "parlays": selected_parlays,
         "parlay_groups": parlay_groups,
