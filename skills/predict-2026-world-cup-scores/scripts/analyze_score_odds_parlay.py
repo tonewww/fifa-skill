@@ -513,6 +513,43 @@ def openness_target_total(match: dict) -> float | None:
     return max(3.0, min(4.4, sum(signals) / len(signals)))
 
 
+def hard_strength_edge(match: dict, favorite_group: str) -> float:
+    if favorite_group == "draw":
+        return 0.0
+    prediction = match.get("prediction") or {}
+    strength = prediction.get("strength") or {}
+    lineups = prediction.get("lineups") or {}
+    injuries = prediction.get("injuries") or {}
+    team_a_id = ((prediction.get("team_a") or {}).get("team_id"))
+    team_b_id = ((prediction.get("team_b") or {}).get("team_id"))
+    if team_a_id not in strength or team_b_id not in strength:
+        return 0.0
+    favorite_id, opponent_id = (
+        (team_a_id, team_b_id) if favorite_group == "home_win" else (team_b_id, team_a_id)
+    )
+    favorite_strength = strength.get(favorite_id) or {}
+    opponent_strength = strength.get(opponent_id) or {}
+    edge = (
+        0.38 * (float(favorite_strength.get("overall") or 0.0) - float(opponent_strength.get("overall") or 0.0))
+        + 0.22 * (float(favorite_strength.get("attack") or 0.0) - float(opponent_strength.get("defense") or 0.0))
+        + 0.18 * (float(favorite_strength.get("form") or 0.0) - float(opponent_strength.get("form") or 0.0))
+        + 0.12 * (float(favorite_strength.get("fitness") or 0.0) - float(opponent_strength.get("fitness") or 0.0))
+        - 0.10 * (float(favorite_strength.get("uncertainty") or 20.0) - float(opponent_strength.get("uncertainty") or 20.0))
+    )
+    favorite_lineup = lineups.get(favorite_id) or {}
+    opponent_lineup = lineups.get(opponent_id) or {}
+    if favorite_lineup.get("starter_count") or opponent_lineup.get("starter_count"):
+        edge += 0.12 * (
+            float(favorite_lineup.get("starter_count") or 0.0)
+            - float(opponent_lineup.get("starter_count") or 0.0)
+        )
+    favorite_injuries = injuries.get(favorite_id) or {}
+    opponent_injuries = injuries.get(opponent_id) or {}
+    edge -= 0.35 * len(favorite_injuries.get("major") or [])
+    edge += 0.35 * len(opponent_injuries.get("major") or [])
+    return edge
+
+
 def score_shape_context(match: dict, favorite_group: str) -> dict | None:
     if favorite_group == "draw":
         return None
@@ -650,13 +687,29 @@ def score_group_for_recommendation(match: dict, favorite_group: str, raw_top_gro
     market_wdl = match.get("market_wdl") or {}
     prediction = match.get("prediction") or {}
     openness = prediction.get("openness") or {}
+    stage = str(prediction.get("stage") or "")
+    stage_lower = stage.lower()
+    is_knockout = any(
+        token in stage_lower
+        for token in ("round", "knockout", "quarter", "semi", "final")
+    )
     favorite_probability = float(blended_wdl.get(favorite_group) or 0.0)
     raw_group_probability = float(blended_wdl.get(raw_top_group, 0.0) or 0.0)
     sorted_wdl = sorted((float(value) for value in blended_wdl.values()), reverse=True)
     favorite_edge = sorted_wdl[0] - sorted_wdl[1] if len(sorted_wdl) >= 2 else 0.0
+    draw_edge = favorite_probability - float(blended_wdl.get("draw", 0.0) or 0.0)
+    draw_is_runner_up = (
+        raw_top_group == "draw"
+        and float(blended_wdl.get("draw", 0.0) or 0.0)
+        >= max(
+            (float(value) for key, value in blended_wdl.items() if key not in {favorite_group, "draw"}),
+            default=0.0,
+        )
+    )
     lambda_total = float(prediction.get("lambda_a") or 0.0) + float(prediction.get("lambda_b") or 0.0)
     total_delta = float(openness.get("total_delta") or 0.0)
     market_draw_probability = float(market_wdl.get("draw") or 0.0)
+    favorite_hard_edge = hard_strength_edge(match, favorite_group)
 
     if (
         raw_top_group
@@ -669,10 +722,13 @@ def score_group_for_recommendation(match: dict, favorite_group: str, raw_top_gro
     if (
         raw_top_group == "draw"
         and favorite_probability <= 0.50
-        and favorite_edge < 0.17
+        and favorite_edge <= (0.24 if is_knockout else 0.17)
         and raw_group_probability >= 0.22
+        and favorite_hard_edge < 2.25
+        and (draw_is_runner_up or draw_edge <= (0.16 if is_knockout else 0.12))
         and (
-            market_draw_probability >= 0.30
+            is_knockout
+            or market_draw_probability >= 0.30
             or (lambda_total <= 2.65 and total_delta <= 0.12)
         )
     ):
@@ -1550,6 +1606,32 @@ def split_parlays(
         per_group,
         cap_aware_odds_first_key,
     )
+    if len(odds_first) < per_group:
+        fallback_seen = seen | {parlay_signature(parlay) for parlay in odds_first}
+        odds_fallback_pool = parlay_pool(
+            matches,
+            0.005,
+            0.55,
+            strong_favorite_threshold,
+            strong_favorite_edge_threshold,
+            False,
+            odds_max_clear_favorite_deviations,
+            odds_power,
+            restrict_all_favorites=False,
+            leg_limit=31,
+        )
+        enrich_parlays(odds_fallback_pool, 1.0, odds_power)
+        odds_fallback_pool = [
+            parlay for parlay in odds_fallback_pool
+            if parlay_signature(parlay) not in fallback_seen
+        ]
+        odds_first.extend(
+            select_positive_ev_first(
+                odds_fallback_pool,
+                per_group - len(odds_first),
+                cap_aware_odds_first_key,
+            )
+        )
 
     seen.update(parlay_signature(parlay) for parlay in odds_first)
     ev_pool = parlay_pool(
