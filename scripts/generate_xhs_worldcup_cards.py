@@ -210,10 +210,15 @@ def date_label(date_slug: str) -> str:
     return date_slug
 
 
+def competition_label(data: dict) -> str:
+    return str(data.get("competition_label") or "世界杯 2026")
+
+
 def card_wdl(data: dict, date_slug: str, title_date: str) -> Path:
     num_matches = len(data["matches"])
     height = max(1440, 232 + num_matches * 274 + 100)
-    image, draw = base_card(f"{title_date} {num_matches}场胜负概率", "世界杯 2026 赛前方案", "01", height=height)
+    competition = competition_label(data)
+    image, draw = base_card(f"{title_date} {num_matches}场胜负概率", f"{competition} 赛前方案", "01", height=height)
     y = 232
     for index, match in enumerate(data["matches"], start=1):
         box = (170, y, 1020, y + 238)
@@ -332,7 +337,7 @@ def score_explanation(match: dict) -> str:
 def card_scores(data: dict, date_slug: str) -> Path:
     num_matches = len(data["matches"])
     height = max(1440, 228 + num_matches * 306 + 100)
-    image, draw = base_card("AI比分预估", "世界杯 2026 比分预测", "02", height=height)
+    image, draw = base_card("AI比分预估", f"{competition_label(data)} 比分预测", "02", height=height)
     
     y_start = 228
     panels = []
@@ -430,10 +435,10 @@ def short_parlay(parlay: dict, match_short: dict[str, str]) -> str:
 def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Path:
     # We might need a larger height if there are many legs making the text wrap more
     parlay_name = f"{len(data['matches'])} 串 1"
-    image, draw = base_card(f"{parlay_name} 方案", "世界杯 2026 赛前方案", "03", height=1440)
+    image, draw = base_card(f"{parlay_name} 方案", f"{competition_label(data)} 赛前方案", "03", height=1440)
     groups = [
-        ("前 3：稳健方向", "probability_first", COLORS["soft_green"], "更贴近胜负倾向"),
-        ("中 3：进取方向", "odds_first", COLORS["soft_amber"], "保留一处冷门思路"),
+        ("前 3：优先方案", "probability_first", COLORS["soft_green"], "聚焦主比分路径"),
+        ("中 3：进取方向", "odds_first", COLORS["soft_amber"], "保留可选比分路径"),
         ("后 3：高方差方向", "expected_value_first", COLORS["soft_red"], "更激进的比分组合"),
     ]
     y = 226
@@ -473,6 +478,7 @@ def card_parlays(data: dict, date_slug: str, match_short: dict[str, str]) -> Pat
 
 def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, match_short: dict[str, str]) -> Path:
     parlay_name = f"{len(data['matches'])}串1"
+    competition = competition_label(data)
     matches = []
     for match in data["matches"]:
         rel = relationship_context(match)
@@ -487,18 +493,18 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
 
     parlay_lines = []
     for title, key in [
-        ("稳健方向", "probability_first"),
-        ("进取方向", "odds_first"),
+        ("概率优先", "probability_first"),
+        ("赔率优先", "odds_first"),
         ("高方差方向", "expected_value_first"),
     ]:
         parlay_lines.append(f"{title}：")
         for parlay in data["parlay_groups"][key]:
             parlay_lines.append(f"- {short_parlay(parlay, match_short)}")
 
-    body = f"""# 小红书图文文案｜{date_slug} 世界杯预测
+    body = f"""# 小红书图文文案｜{date_slug} {competition}预测
 
 ## 笔记标题
-世界杯 {title_date} {len(data['matches'])}场赛前结论：胜负、比分、{parlay_name}方案
+{competition} {title_date} {len(data['matches'])}场赛前结论：胜负、比分、{parlay_name}方案
 
 ## 正文
 以下只展示赛前模型结论和方案，不展开计算指标。不是投注建议。
@@ -513,7 +519,7 @@ def write_copy(data: dict, paths: list[Path], date_slug: str, title_date: str, m
 {chr(10).join(parlay_lines)}
 
 ## 话题
-#世界杯预测 #足球数据分析 #比分预测 #足球模型 #赛前分析 #小红书体育
+#{competition} #足球数据分析 #比分预测 #足球模型 #赛前分析 #小红书体育
 
 ## 图片文件
 {chr(10).join(f'- {path.name}' for path in paths)}

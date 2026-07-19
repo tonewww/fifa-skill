@@ -142,6 +142,7 @@ python3 skills/predict-2026-world-cup-scores/scripts/review_completed_matches.py
    - Publishing/model rule after the 2026-07-07 review: when the blended WDL leader is an extremely weak favorite (roughly 41% or lower, with less than a four-point edge over the runner-up), do not force the exact-score headline into that favorite's outcome group. Preserve the raw highest-probability scoreline when its outcome bucket has meaningful mass, label the relationship as `防平` or `防冷`, and allow the probability-first parlay block to follow that protected raw-top group. This specifically guards against home/nominal-favorite anchoring in neutral knockout matches such as Portugal-Spain and USA-Belgium.
    - Publishing/model rule after the 2026-07-08 review: in knockout matches, a favorite below roughly 50% with a raw top exact score in the draw bucket should be treated as a regulation-time draw-risk case, even if the favorite has a 17-24 point edge over the draw bucket. Preserve the raw draw headline when the draw bucket is at least about 22%, because penalty/extra-time advancement dynamics can coexist with a 90-minute draw. Separately, when the WDL direction is correct but the actual score is 3-2/2-2 style, keep BTTS and 5-goal tails visible rather than globally inflating all favorites.
    - Publishing/model rule after the 2026-07-09 pre-match audit: draw protection must not become a new anchor. Before promoting a raw draw score over the WDL favorite, check hard football factors first: overall strength, attack-versus-opponent-defense, current tournament form, fitness, major absences, and expected/official starter availability. If the favorite has a material hard-strength or lineup edge, keep the headline score in the favorite outcome group and show the raw draw as a risk/Top 3 candidate rather than the main pick. If lineup and injury data are unknown, say so and keep the adjustment modest.
+   - Modeling rule after the 2026-07-12 quarter-finals: use regulation-time scores only. England-Norway and Argentina-Switzerland both finished 1:1 after 90 minutes before extra-time winners emerged. When a semi-final or final has fewer than two same-stage completed samples, allow the completed knockout regulation-draw share to provide a capped, close-match-only draw prior. It must decay as the feature-strength edge grows and must never override a clear superiority in squad strength, form, fitness, availability, or tactical matchup.
 
 8. Add group standing and qualification incentive context before predicting group-stage slates.
    - Ingest the latest completed match results before analyzing the next odds JSON.
@@ -175,6 +176,8 @@ python3 skills/predict-2026-world-cup-scores/scripts/predict_match.py --db data/
 ```bash
 python3 skills/predict-2026-world-cup-scores/scripts/analyze_score_odds_parlay.py --db data/worldcup2026.sqlite --odds-json pl/YYYY-MM-DD.json --top 9 --mode strength-aware --stake 100 --show-all-scores
 ```
+
+For a club exact-score slate whose teams are absent from the World Cup national-team tables, do not map club names to countries. Archive source-verified first-leg, formation, availability, and series-state context, then use the isolated club fallback so the same 70/30 blend and cap-aware parlay logic are retained without contaminating World Cup strength snapshots.
 
 ## Modeling Rules
 

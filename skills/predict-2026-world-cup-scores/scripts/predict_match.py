@@ -723,6 +723,7 @@ def stage_completed_goal_profile(conn, family: str) -> dict:
         return {
             "sample_size": 0,
             "avg_total_goals": None,
+            "draw_share": 0.0,
             "high_total_share": 0.0,
             "very_high_total_share": 0.0,
             "blowout_share": 0.0,
@@ -738,16 +739,19 @@ def stage_completed_goal_profile(conn, family: str) -> dict:
     ).fetchall()
     totals = []
     margins = []
+    draws = []
     for row in rows:
         if stage_family(row["stage"]) == family:
             score_a = float(row["score_a"] or 0)
             score_b = float(row["score_b"] or 0)
             totals.append(score_a + score_b)
             margins.append(abs(score_a - score_b))
+            draws.append(score_a == score_b)
     if not totals:
         return {
             "sample_size": 0,
             "avg_total_goals": None,
+            "draw_share": 0.0,
             "high_total_share": 0.0,
             "very_high_total_share": 0.0,
             "blowout_share": 0.0,
@@ -756,9 +760,36 @@ def stage_completed_goal_profile(conn, family: str) -> dict:
     return {
         "sample_size": sample_size,
         "avg_total_goals": sum(totals) / sample_size,
+        "draw_share": sum(1 for draw in draws if draw) / sample_size,
         "high_total_share": sum(1 for total in totals if total >= 4) / sample_size,
         "very_high_total_share": sum(1 for total in totals if total >= 5) / sample_size,
         "blowout_share": sum(1 for margin in margins if margin >= 3) / sample_size,
+    }
+
+
+def completed_knockout_draw_profile(conn) -> dict:
+    if not table_exists(conn, "fixtures"):
+        return {"sample_size": 0, "draw_share": 0.0}
+    rows = conn.execute(
+        """
+        SELECT stage, score_a, score_b
+        FROM fixtures
+        WHERE score_a IS NOT NULL
+          AND score_b IS NOT NULL
+          AND lower(coalesce(status, 'final')) = 'final'
+        """
+    ).fetchall()
+    draws = []
+    for row in rows:
+        family = stage_family(row["stage"])
+        if family not in {"round32", "round16", "quarter", "semi", "final"}:
+            continue
+        draws.append(float(row["score_a"] or 0) == float(row["score_b"] or 0))
+    if not draws:
+        return {"sample_size": 0, "draw_share": 0.0}
+    return {
+        "sample_size": len(draws),
+        "draw_share": sum(1 for draw in draws if draw) / len(draws),
     }
 
 
@@ -775,6 +806,7 @@ def stage_goal_context(
     baseline_total = float(params.get("openness_baseline_total", 2.55) or 2.55)
     sample_size = int(profile["sample_size"] or 0)
     avg_total_goals = profile["avg_total_goals"]
+    draw_share = float(profile.get("draw_share") or 0.0)
     high_total_share = float(profile.get("high_total_share") or 0.0)
     very_high_total_share = float(profile.get("very_high_total_share") or 0.0)
     blowout_share = float(profile.get("blowout_share") or 0.0)
@@ -812,6 +844,17 @@ def stage_goal_context(
         tail_pressure = clamp(tail_pressure, -0.12, 0.30) * confidence
     score_tail_boost = max(0.0, tail_pressure) * (0.65 + 0.35 * data_weight)
     score_tail_dampener = max(0.0, -tail_pressure) * (0.65 + 0.35 * data_weight)
+    knockout_draw_profile = completed_knockout_draw_profile(conn)
+    cross_round_draw_bonus = 0.0
+    if family in {"semi", "final"} and sample_size < 2:
+        knockout_sample = int(knockout_draw_profile["sample_size"] or 0)
+        knockout_confidence = knockout_sample / (knockout_sample + sample_half_life) if knockout_sample else 0.0
+        cross_round_draw_bonus = clamp(
+            (float(knockout_draw_profile["draw_share"] or 0.0) - 0.28)
+            * (0.35 + 0.65 * knockout_confidence),
+            0.0,
+            0.035,
+        )
     notes = []
     if avg_total_goals is None:
         notes.append("No completed same-stage sample; stage multiplier stays neutral.")
@@ -835,11 +878,14 @@ def stage_goal_context(
         "multiplier": multiplier,
         "sample_size": sample_size,
         "avg_total_goals": avg_total_goals,
+        "draw_share": draw_share,
         "high_total_share": high_total_share,
         "very_high_total_share": very_high_total_share,
         "blowout_share": blowout_share,
         "score_tail_boost": score_tail_boost,
         "score_tail_dampener": score_tail_dampener,
+        "cross_round_draw_bonus": cross_round_draw_bonus,
+        "knockout_draw_share": float(knockout_draw_profile["draw_share"] or 0.0),
         "confidence": confidence,
         "open_match_offset": open_match_offset,
         "notes": notes,
@@ -915,6 +961,11 @@ def strength_wdl_prior(
     stage_multiplier = float(stage_context.get("multiplier") or 1.0)
     stage_confidence = float(stage_context.get("confidence") or 0.0)
     knockout_draw_bonus = clamp((1.0 - stage_multiplier) * (0.45 + 0.55 * stage_confidence), 0.0, 0.10)
+    cross_round_draw_bonus = float(stage_context.get("cross_round_draw_bonus") or 0.0)
+    # Cross-round draw evidence only softens close late-knockout matchups.
+    # A clear team-strength edge should continue to dominate the WDL prior.
+    close_match_weight = clamp(1.0 - abs(feature_edge) / 0.60, 0.0, 1.0)
+    knockout_draw_bonus += cross_round_draw_bonus * close_match_weight
     if stage_kind == "group":
         knockout_draw_bonus = 0.0
     draw_score = -0.18 - 0.55 * abs(feature_edge) - openness_draw_penalty + knockout_draw_bonus
@@ -1310,11 +1361,14 @@ def predict(
                         if stage_context["avg_total_goals"] is not None
                         else None
                     ),
+                    "draw_share": round(stage_context["draw_share"], 3),
                     "high_total_share": round(stage_context["high_total_share"], 3),
                     "very_high_total_share": round(stage_context["very_high_total_share"], 3),
                     "blowout_share": round(stage_context["blowout_share"], 3),
                     "score_tail_boost": round(stage_context["score_tail_boost"], 3),
                     "score_tail_dampener": round(stage_context["score_tail_dampener"], 3),
+                    "knockout_draw_share": round(stage_context["knockout_draw_share"], 3),
+                    "cross_round_draw_bonus": round(stage_context["cross_round_draw_bonus"], 4),
                     "confidence": round(stage_context["confidence"], 3),
                     "open_match_offset": round(stage_context["open_match_offset"], 3),
                     "notes": stage_context["notes"],

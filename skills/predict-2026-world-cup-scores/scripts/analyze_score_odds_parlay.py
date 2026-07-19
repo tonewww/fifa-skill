@@ -554,6 +554,7 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
     if favorite_group == "draw":
         return None
     prediction = match.get("prediction") or {}
+    is_club_low_sample = bool(prediction.get("club_low_sample"))
     openness = prediction.get("openness") or {}
     blended_wdl = match.get("blended_wdl") or {}
     market_wdl = match.get("market_wdl") or {}
@@ -628,7 +629,8 @@ def score_shape_context(match: dict, favorite_group: str) -> dict | None:
         }
 
     if (
-        favorite_probability >= 0.45
+        not is_club_low_sample
+        and favorite_probability >= 0.45
         and favorite_edge >= 0.12
         and high_tail_environment
         and market_draw_probability < 0.30
@@ -1057,6 +1059,16 @@ def analyze_match(
     }
     match["recommended_score"] = recommended_score_candidates(match)
     match["relationship"] = relationship_context(match)
+    relationship = match["relationship"]
+    recommendation = match["recommended_score"]
+    if (
+        relationship.get("label") == "胜负接近"
+        and recommendation.get("group") != recommendation.get("favorite_group")
+    ):
+        recommendation["analysis_note"] = (
+            "主客胜接近，且模型与精确比分赔率对方向存在分歧；"
+            "首选比分保留完整混合分布的最高值，以明确呈现常规时间平局风险。"
+        )
     return match
 
 
@@ -1122,6 +1134,8 @@ def match_favorite_group(match: dict) -> tuple[str, float]:
 
 def relationship_context(match: dict) -> dict:
     wdl = match.get("blended_wdl") or {}
+    model_wdl = match.get("model_wdl") or {}
+    market_wdl = match.get("market_wdl") or {}
     favorite_group, favorite_probability = match_favorite_group(match)
     draw_probability = float(wdl.get("draw") or 0.0)
     stage = str((match.get("prediction") or {}).get("stage") or "")
@@ -1143,6 +1157,31 @@ def relationship_context(match: dict) -> dict:
         favorite_group != "draw"
         and recommended_group != favorite_group
         and selection_reason == "ultra_balanced_raw_top"
+    )
+    home_win_probability = float(wdl.get("home_win") or 0.0)
+    away_win_probability = float(wdl.get("away_win") or 0.0)
+    win_side_edge = abs(home_win_probability - away_win_probability)
+    near_tied_win_sides = (
+        favorite_group in {"home_win", "away_win"}
+        and win_side_edge <= 0.025
+        and favorite_probability <= 0.46
+    )
+    # Exact-score odds can lean toward one side while the strength model leans
+    # toward the other. A 70/30 blend must not turn that disagreement into a
+    # deceptively firm win label when the resulting edge is still marginal.
+    model_favorite_group, _model_favorite_probability = max(
+        model_wdl.items(), key=lambda item: item[1]
+    ) if model_wdl else (favorite_group, favorite_probability)
+    market_favorite_group, _market_favorite_probability = max(
+        market_wdl.items(), key=lambda item: item[1]
+    ) if market_wdl else (favorite_group, favorite_probability)
+    market_model_direction_split = (
+        favorite_group in {"home_win", "away_win"}
+        and model_favorite_group in {"home_win", "away_win"}
+        and market_favorite_group in {"home_win", "away_win"}
+        and model_favorite_group != market_favorite_group
+        and win_side_edge <= 0.05
+        and favorite_probability <= 0.46
     )
     close_draw = (
         favorite_group != "draw"
@@ -1171,6 +1210,26 @@ def relationship_context(match: dict) -> dict:
             "probability_text": format_pct(draw_probability),
             "probability_first_group": "draw",
             "note": "平局是最高概率结果。",
+        }
+    if near_tied_win_sides or market_model_direction_split:
+        probability_first_group = recommended_group if recommended_group in {"home_win", "draw", "away_win"} else favorite_group
+        note = (
+            "模型与精确比分赔率对主客胜方向存在分歧，70/30混合后的微弱领先不视为稳定热门。"
+            if market_model_direction_split
+            else "主客胜概率差距不足2.5个百分点，不将微弱领先端视为稳定热门。"
+        )
+        return {
+            "label": "胜负接近",
+            "primary_group": favorite_group,
+            "secondary_group": None,
+            "probability": favorite_probability,
+            "probability_text": (
+                f"主{format_pct(home_win_probability)} / "
+                f"客{format_pct(away_win_probability)} / "
+                f"平{format_pct(draw_probability)}"
+            ),
+            "probability_first_group": probability_first_group,
+            "note": note,
         }
     if draw_protected or ultra_balanced_protected:
         secondary_group = recommended_group if recommended_group else "draw"
@@ -1703,6 +1762,9 @@ def standing_brief(row: dict | None) -> str:
 
 
 def standings_context_text(match: dict) -> str:
+    series_context = match.get("series_context") or {}
+    if series_context.get("table_text"):
+        return str(series_context["table_text"])
     stage = str((match.get("prediction") or {}).get("stage") or "")
     if "group" not in stage.lower():
         return f"{stage or '淘汰赛'}口径：不套用小组积分/出线动机修正"
@@ -1722,13 +1784,15 @@ def standings_context_text(match: dict) -> str:
 def tactical_adjustment_text(match: dict) -> str:
     adjustment = match.get("tactical_adjustment") or {}
     multipliers = adjustment.get("wdl_multipliers") or {}
+    report_note = str(adjustment.get("report_note") or "")
     if not multipliers or all(abs(float(value) - 1.0) < 0.005 for value in multipliers.values()):
-        return ""
-    return (
+        return report_note
+    multiplier_note = (
         f"出线动机修正：主胜x{multipliers.get('home_win', 1.0):.2f}、"
         f"平局x{multipliers.get('draw', 1.0):.2f}、"
         f"客胜x{multipliers.get('away_win', 1.0):.2f}。"
     )
+    return f"{multiplier_note}{report_note}"
 
 
 def score_rows(match: dict, limit: int = 8, show_all: bool = False) -> list[dict]:
@@ -1767,6 +1831,7 @@ def write_markdown(result: dict) -> str:
     parlay_count = len(result["matches"])
     cap = parlay_odds_cap(parlay_count)
     cap_text = f"；{label} 单注结算赔率封顶 {format_odds(cap)} 倍" if cap is not None else ""
+    relationship_context_header = str(result.get("relationship_context_header") or "积分/净胜球与出线动机")
     lines = [
         f"数据口径：{result['odds_path']}；混合概率 = 模型 {format_pct(1 - result['market_weight'])} + 赔率隐含 {format_pct(result['market_weight'])}。",
         (
@@ -1775,12 +1840,15 @@ def write_markdown(result: dict) -> str:
             "预期净收益 = 预期返还 - 每注，ROI = 概率 × 结算赔率 - 1。"
         ),
         f"说明：输出为概率和期望值分析，不是投注建议；精确比分 {label} 的单一命中率天然很低。",
+    ]
+    lines.extend(str(note) for note in result.get("report_prelude", []) if str(note).strip())
+    lines.extend([
         "",
         "## 1. 各场次的胜负关系",
         "",
-        "| 场次 | 主胜 | 平局 | 客胜 | 胜平负关系 | 关系概率 | 积分/净胜球与出线动机 | 平局提示 |",
+        f"| 场次 | 主胜 | 平局 | 客胜 | 胜平负关系 | 关系概率 | {relationship_context_header} | 平局提示 |",
         "|---|---:|---:|---:|---|---:|---|---|",
-    ]
+    ])
     for match in result["matches"]:
         wdl = match["blended_wdl"]
         relationship = match.get("relationship") or relationship_context(match)

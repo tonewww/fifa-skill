@@ -153,8 +153,11 @@ def apply_corrections(db_path: Path, rating_date: str, results_dir: Path, upcomi
     conn = connect(db_path)
     try:
         mapping = team_name_map(conn)
-        active = active_teams_from_results(results_dir, rating_date, mapping)
-        active.update(active_teams_from_upcoming(upcoming_json, mapping))
+        # An upcoming slate is the authoritative active-bracket set. Historical
+        # knockout winners include teams that were eliminated in later rounds.
+        active = active_teams_from_upcoming(upcoming_json, mapping)
+        if not active:
+            active = active_teams_from_results(results_dir, rating_date, mapping)
         rows = []
         for team_id in sorted(active):
             stats = tournament_stats(conn, team_id, since, rating_date)
